@@ -1,0 +1,11 @@
+node_modules/
+dist/
+*.tsbuildinfo
+*.db
+*.sqlite
+.openmap/
+.DS_Store
+.env
+.env.*
+coverage/
+reference/

@@ -1,0 +1,65 @@
+{
+  "name": "place-memory-mini",
+  "description": "A lightweight LoCoMo-style eval for map-aware memory: multi-session location conversations + probes across recall / preference inference / spatial-semantic calibration / reconcile / adversarial.",
+  "user": "alex",
+  "sessions": [
+    {
+      "title": "coffee habit",
+      "turns": [
+        { "role": "assistant", "content": "Morning! Coffee near you: \"Blue Bottle\" 0.4km, \"Ritual Coffee\" 3km." },
+        { "role": "user", "content": "let's do \"Ritual Coffee\" — went there and loved it" },
+        { "role": "user", "content": "grabbed coffee at \"Blue Bottle\" too, pretty good" }
+      ]
+    },
+    {
+      "title": "ramen plan then visit",
+      "turns": [
+        { "role": "user", "content": "I really want to go to \"Ramen Nagi\"" },
+        { "role": "user", "content": "finally went to \"Ramen Nagi\" last night and loved it" }
+      ]
+    },
+    {
+      "title": "date night",
+      "turns": [
+        { "role": "assistant", "content": "\"Bella\" in Shibuya is 6km away, a ¥600 tasting menu." },
+        { "role": "user", "content": "romantic dinner at \"Bella\" with my partner, loved it" }
+      ]
+    },
+    {
+      "title": "a miss",
+      "turns": [{ "role": "user", "content": "tried \"Loud Sports Bar\", hated it — way too noisy" }]
+    },
+    {
+      "title": "a walk",
+      "turns": [
+        { "role": "assistant", "content": "the new cafe is a 12 minute walk from here" },
+        { "role": "user", "content": "walked over to \"Kaffe Roastery\", loved it" }
+      ]
+    },
+    {
+      "title": "dinner crawl (mixed sentiment in one turn)",
+      "turns": [{ "role": "user", "content": "dinner crawl: \"Stellar\" was amazing, but \"Dud Diner\" was awful" }]
+    },
+    {
+      "title": "a quiet coffee spot",
+      "turns": [{ "role": "user", "content": "loved \"Quiet Beans\", such a calm quiet coffee spot" }]
+    }
+  ],
+  "probes": [
+    { "kind": "recall", "category": "single-hop", "query": "a good coffee place", "expectTop": "Ritual Coffee" },
+    { "kind": "ask", "category": "preference", "question": "do I like coffee?", "expectLikely": true },
+    { "kind": "ask", "category": "preference", "question": "do I like ramen?", "expectLikely": true },
+    { "kind": "ask", "category": "adversarial", "question": "do I like sushi?", "expectLikely": false },
+    { "kind": "belief", "category": "preference", "predicate": "likes", "object": "coffee" },
+    { "kind": "calibration", "category": "spatial", "term": "near", "expect": 6 },
+    { "kind": "calibration", "category": "spatial-context", "term": "near", "context": "date", "expect": 6 },
+    { "kind": "calibration", "category": "spatial", "term": "budget", "min": 500 },
+    { "kind": "reconcile", "category": "update", "place": "Ramen Nagi", "expectCount": 1, "expectRelationship": "loved" },
+    { "kind": "memory", "category": "sentiment", "place": "Loud Sports Bar", "expectRelationship": "disliked" },
+    { "kind": "calibration", "category": "spatial", "term": "walk_time", "min": 12 },
+    { "kind": "memory", "category": "mixed-sentiment", "place": "Stellar", "expectRelationship": "loved", "llmOnly": true },
+    { "kind": "memory", "category": "mixed-sentiment", "place": "Dud Diner", "expectRelationship": "disliked", "llmOnly": true },
+    { "kind": "recall", "category": "multi-hop", "query": "a quiet coffee spot", "expectTop": "Quiet Beans", "llmOnly": true },
+    { "kind": "belief", "category": "region", "predicate": "frequents", "object": "Shibuya", "llmOnly": true }
+  ]
+}
