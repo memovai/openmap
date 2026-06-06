@@ -14,7 +14,7 @@ agent's job); openmap is the memory, not the maps API.
 
 ## What it does
 
-- **Remembers places from conversation** — `remember(text)` / `observe(turns)` pull
+- **Remembers places from conversation** — `capture(turns)` / `observe(turns)` pull
   place mentions + relationship (loved/visited/want…) and **reconcile** them
   (ADD / UPDATE / NOOP) so "want to go to X" → later "went to X, loved it" updates
   one memory instead of duplicating.
@@ -44,40 +44,28 @@ extraction). Set `OPENAI_API_KEY` to upgrade embeddings + LLM extraction/intent.
 
 ```bash
 # ── agent hooks: the two calls a host wires into its turn loop ──
-openmap -u alice recall-context "a quiet spot to work"   # auto-recall → {system, prepend} to inject
-openmap -u alice capture conversation.json               # auto-capture → log raw turns (L0) + extract
-openmap -u alice conversation "loved the ramen place"    # search raw history to ground a memory
+openmap -u alice context "a quiet spot to work"     # before answer → {system, prepend}
+openmap -u alice observe transcript.json           # after exchange → raw L0 + extracted memory
 
-# capture from conversation (the only source)
-openmap -u alice observe conversation.json        # [{role,content}, …] → extract + reconcile (no L0 log)
-openmap -u alice remember 'loved "Blue Bottle Coffee"' --relationship loved
+# human/debug reads
+openmap -u alice search "a cozy quiet spot to work" # ranked remembered places
+openmap -u alice evidence "loved the ramen place"  # raw source turns for grounding
+openmap -u alice debug graph --mermaid             # inspect derived graph
+openmap -u alice debug profile                     # taste profile + stats
 
-# recall your places by resolved intent
-openmap -u alice recall "a cozy quiet spot to work"   # → frame + taste/vibe-ranked places
-openmap -u alice intent "romantic dinner with my parents"   # just the resolved frame
+# manual overrides are intentionally explicit and off the happy path
+openmap -u alice manual remember 'loved "Blue Bottle Coffee"' --relationship loved
+openmap -u alice manual calibrate near 3
+openmap -u alice manual memory list
 
-# inference + the knowledge graph
-openmap -u alice ask "do I like coffee?"          # infer from behavior, with provenance
-openmap -u alice consolidate                      # promote events → beliefs
-openmap -u alice beliefs                           # the semantic graph edges
-openmap -u alice graph --mermaid                   # the knowledge graph as Mermaid
-
-# learned spatial vocabulary + areas
-openmap -u alice calibrate near 3                  # "near" ≈ 3km for me (or learn-near 3)
-openmap -u alice calibrations                      # near/walk_time/budget/noise/crowd/transit_walk
-openmap -u alice anchors                           # home/work/usual area/near radius
-openmap -u alice regions                           # areas I'm active in
-openmap -u alice places alias "the plant cafe" <placeId> # canonicalize future mentions
-
-# persona, management, MCP
-openmap -u alice persona set --likes cozy,wine --dislikes loud
-openmap -u alice memory list ; openmap -u alice places list
-openmap serve-mcp
+openmap serve
 ```
 
 ### Auto-learning from conversation
 
-`observe` doesn't just store — it learns. When the agent offers options with
+`observe` doesn't ask the agent to fill fields like `--relationship loved`; it
+logs the exchange, extracts those relationships from the user's wording, and
+learns. When the agent offers options with
 distances, prices, ambient fit, or transit access and the user accepts one,
 openmap updates the calibration layer automatically (revealed preference):
 
@@ -109,23 +97,25 @@ in the recalled-places block when a raw turn supports a recalled place. Each cap
 extraction also creates an L2 `scenario` summary grouping turn ids, place ids, concepts,
 and intents; repeated scenarios are rolled up on demand as `routines`, such as a durable
 "focus: quiet + near transit" pattern across work/study episodes. As a
-**Claude Code** hook: run `openmap recall-context "$PROMPT"` on `UserPromptSubmit` to inject
-context, and `openmap capture transcript.json` on `Stop` to capture the turn.
+**Claude Code** hook: run `openmap context "$PROMPT"` on `UserPromptSubmit` to inject
+context, and `openmap observe transcript.json` on `Stop` to capture the turn.
 
 ## As an MCP server
 
 ```bash
 npm install @modelcontextprotocol/sdk
-openmap serve-mcp
+openmap serve
 ```
 
-Tools: `recall_context` (auto-recall), `capture` (auto-capture), `conversation_search`,
-`scenarios`, `routines`,
-`remember`, `observe`, `recall`, `resolve_intent`, `ask`, `consolidate`,
-`repair_contradictions`, `beliefs`, `graph`, `taste_profile`, `get_persona`, `set_persona`, `set_place_role`,
-`add_place_alias`, `place_aliases`,
-`anchors`, `regions`, `calibrate`, `calibrations`, `learn_near`, `list_memories`,
-`forget`, `list_collections`, `add_to_collection` (all accept an optional `userId`).
+Primary tools: `recall_context` (auto-recall), `capture` (auto-capture),
+`conversation_search` (raw evidence), `taste_profile`, `scenarios`, `routines`.
+
+Advanced/manual tools are also exposed for tests and admin flows: `remember`,
+`observe`, `recall`, `resolve_intent`, `ask`, `consolidate`, `repair_contradictions`,
+`beliefs`, `graph`, `get_persona`, `set_persona`, `set_place_role`,
+`add_place_alias`, `place_aliases`, `anchors`, `regions`, `calibrate`,
+`calibrations`, `learn_near`, `list_memories`, `forget`, `list_collections`,
+`add_to_collection` (all accept an optional `userId`).
 
 ## As a library
 

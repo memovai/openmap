@@ -9,7 +9,7 @@ process.on("warning", (w) => {
 import { readFile } from "node:fs/promises";
 import { Command } from "commander";
 import { loadConfig, resolvedEmbedder, resolvedTagger } from "./core/config.js";
-import { buildOpenMap } from "./openmap.js";
+import type { ConversationTurn } from "./openmap.js";
 import {
   type GeoPoint,
   type Place,
@@ -18,6 +18,8 @@ import {
   personaPrefsSchema,
   relationshipSchema,
 } from "./core/types.js";
+
+type AnyOptions = Record<string, any>;
 
 const emit = (obj: unknown) => console.log(JSON.stringify(obj, null, 2));
 const list = (s?: string): string[] => (s ? s.split(",").map((x) => x.trim()).filter(Boolean) : []);
@@ -30,275 +32,476 @@ function parseNear(near?: string): GeoPoint | null {
   return { lat, lng };
 }
 
+async function readTurns(file: string): Promise<ConversationTurn[]> {
+  const turns = JSON.parse(await readFile(file, "utf-8"));
+  if (!Array.isArray(turns)) throw new Error(`invalid conversation file '${file}', expected an array`);
+  return turns as ConversationTurn[];
+}
+
 const placeBrief = (p: Place) => ({
   name: p.name, placeId: p.id, category: p.category, address: p.address,
   lat: p.lat, lng: p.lng, tags: p.tags,
 });
 const scored = (items: ScoredPlace[]) =>
-  items.map((s) => ({ ...placeBrief(s.place), score: s.score, distanceKm: s.distanceKm, relationship: s.relationship, source: s.place.source, reasons: s.reasons }));
+  items.map((s) => ({
+    ...placeBrief(s.place),
+    score: s.score,
+    distanceKm: s.distanceKm,
+    relationship: s.relationship,
+    source: s.place.source,
+    reasons: s.reasons,
+  }));
 
 const program = new Command();
 program
   .name("openmap")
-  .description("A map-aware memory layer for AI agents — fed by conversation. JSON to stdout for agents.")
+  .description("Conversation-fed place memory for AI agents. JSON to stdout.")
   .version("0.3.0")
-  .option("-u, --user <id>", "user id — scopes events, memory, beliefs, persona, collections", "default");
+  .option("-u, --user <id>", "user id — scopes memory, turns, beliefs, and collections", "default")
+  .addHelpText("after", `
+Agent loop:
+  openmap context "$USER_MESSAGE"      # before answering
+  openmap observe transcript.json      # after the exchange
+
+Manual overrides and inspection live under:
+  openmap manual --help
+  openmap debug --help
+`);
+
 const user = (): string => program.opts().user as string;
+const cmd = (parent: Command, signature: string, hidden = false): Command =>
+  hidden ? parent.command(signature, { hidden: true }) : parent.command(signature);
+const openMap = async () => {
+  const { buildOpenMap } = await import("./openmap.js");
+  return buildOpenMap();
+};
 
-// ---- search / write --------------------------------------------------------
-program
-  .command("remember <text>")
-  .description("Extract place mentions, resolve them, store memories + an event")
-  .option("-r, --relationship <rel>", "loved|liked|visited|want_to_go|disliked|mentioned", "mentioned")
-  .option("-n, --note <note>")
-  .option("--near <lat,lng>")
-  .option("--companions <names>")
-  .action(async (text: string, o) => {
-    const out = await buildOpenMap().remember(text, {
-      userId: user(), relationship: relationshipSchema.parse(o.relationship),
-      note: o.note ?? null, near: parseNear(o.near), companions: list(o.companions),
+// ---- action implementations ------------------------------------------------
+async function observeAction(file: string, o: AnyOptions) {
+  const turns = await readTurns(file);
+  emit(await (await openMap()).capture(turns, { userId: user(), extract: o.extract }));
+}
+
+async function extractAction(file: string) {
+  const turns = await readTurns(file);
+  emit(await (await openMap()).observe(turns, { userId: user() }));
+}
+
+async function manualRememberAction(text: string, o: AnyOptions) {
+  const out = await (await openMap()).remember(text, {
+    userId: user(),
+    relationship: relationshipSchema.parse(o.relationship ?? "mentioned"),
+    note: o.note ?? null,
+    near: parseNear(o.near),
+    companions: list(o.companions),
+  });
+  emit({ stored: out.length, memories: out.map((m) => ({ id: m.id, placeId: m.placeId, relationship: m.relationship, affect: m.affect })) });
+}
+
+async function searchAction(query: string, o: AnyOptions) {
+  const om = await openMap();
+  const frame = await om.resolveIntent(query);
+  const results = await om.recall(query, parseNear(o.near), Number(o.limit ?? 5), user());
+  emit({ query, frame, results: scored(results) });
+}
+
+async function contextAction(query: string, o: AnyOptions) {
+  const ctx = await (await openMap()).recallContext(query, { near: parseNear(o.near), limit: Number(o.limit ?? 5), userId: user() });
+  emit({ query, system: ctx.system, prepend: ctx.prepend, places: scored(ctx.places), sources: ctx.sources });
+}
+
+async function evidenceAction(query: string, o: AnyOptions) {
+  emit({ query, turns: (await openMap()).searchConversation(query, { userId: user(), limit: Number(o.limit ?? 10) }) });
+}
+
+async function intentAction(query: string) {
+  emit(await (await openMap()).resolveIntent(query));
+}
+
+async function askAction(question: string) {
+  emit((await openMap()).ask(question, user()));
+}
+
+async function inferAction(concept: string, o: AnyOptions) {
+  emit((await openMap()).infer(concept, o.predicate as Predicate, user()));
+}
+
+async function consolidateAction() {
+  emit({ written: (await openMap()).consolidate(user()) });
+}
+
+async function repairContradictionsAction() {
+  emit({ repaired: (await openMap()).repairContradictions(user()) });
+}
+
+async function beliefsAction(o: AnyOptions) {
+  emit({ beliefs: (await openMap()).beliefs(user(), { predicate: o.predicate, minConfidence: o.min ? Number(o.min) : undefined }) });
+}
+
+async function graphAction(o: AnyOptions) {
+  const om = await openMap();
+  if (o.mermaid) console.log(om.graphMermaid(user()));
+  else emit(om.graph(user()));
+}
+
+async function eventsAction(o: AnyOptions) {
+  emit({ events: (await openMap()).listEvents(user(), { kind: o.kind, concept: o.concept, limit: Number(o.limit ?? 50) }) });
+}
+
+async function profileAction() {
+  emit((await openMap()).tasteProfile(user()));
+}
+
+async function anchorsAction() {
+  emit((await openMap()).anchors(user()));
+}
+
+async function learnNearAction(km: string) {
+  const om = await openMap();
+  om.learn(user(), "near", Number(km));
+  emit(om.anchors(user()));
+}
+
+async function calibrateAction(term: string, value: string, o: AnyOptions) {
+  const om = await openMap();
+  om.learn(user(), term, Number(value), o.context);
+  emit({ calibrations: om.calibrations(user()) });
+}
+
+async function calibrationsAction() {
+  emit({ calibrations: (await openMap()).calibrations(user()) });
+}
+
+async function regionsAction() {
+  emit({ regions: (await openMap()).regions(user()) });
+}
+
+async function scenariosAction(o: AnyOptions) {
+  emit({ scenarios: (await openMap()).scenarios(user(), { limit: Number(o.limit ?? 20), placeId: o.place, intent: o.intent }) });
+}
+
+async function routinesAction(o: AnyOptions) {
+  emit({
+    routines: (await openMap()).routines(user(), {
+      limit: Number(o.limit ?? 20),
+      scenarioLimit: Number(o.scenarioLimit ?? 200),
+      minScenarios: Number(o.minScenarios ?? 2),
+      intent: o.intent,
+      concept: o.concept,
+    }),
+  });
+}
+
+function configAction() {
+  const c = loadConfig();
+  emit({
+    dbPath: c.dbPath,
+    embedder: resolvedEmbedder(c),
+    tagger: resolvedTagger(c),
+    openaiKey: Boolean(c.openaiApiKey),
+    baseUrl: c.openaiBaseUrl,
+    llm: c.openaiApiKey ? (c.openaiBaseUrl ? "openai-compatible (BYOC)" : "openai") : "offline (inject a runner to use a model)",
+  });
+}
+
+async function serveAction() {
+  const { main } = await import("./mcp.js");
+  await main();
+}
+
+// ---- command builders ------------------------------------------------------
+function addObserveCommand(parent: Command, name: string, hidden = false) {
+  cmd(parent, `${name} <file>`, hidden)
+    .description("Ingest conversation JSON: log raw turns to L0 and auto-extract memory.")
+    .option("--no-extract", "only log raw turns; defer extraction")
+    .action(observeAction);
+}
+
+function addContextCommand(parent: Command, name: string, hidden = false) {
+  cmd(parent, `${name} <query>`, hidden)
+    .description("Build memory context to inject before the agent answers.")
+    .option("--near <lat,lng>")
+    .option("-l, --limit <n>", "max recalled places", "5")
+    .action(contextAction);
+}
+
+function addSearchCommand(parent: Command, name: string, hidden = false) {
+  cmd(parent, `${name} <query>`, hidden)
+    .description("Search remembered places by intent, taste, affordances, and proximity.")
+    .option("--near <lat,lng>")
+    .option("-l, --limit <n>", "max results", "5")
+    .action(searchAction);
+}
+
+function addEvidenceCommand(parent: Command, name: string, hidden = false) {
+  cmd(parent, `${name} <query>`, hidden)
+    .description("Search raw conversation evidence from L0.")
+    .option("-l, --limit <n>", "max turns", "10")
+    .action(evidenceAction);
+}
+
+function addManualRememberCommand(parent: Command, name: string, hidden = false) {
+  cmd(parent, `${name} <text>`, hidden)
+    .description("Manual test/admin write. Normal agents should use observe instead.")
+    .option("-r, --relationship <rel>", "loved|liked|visited|want_to_go|disliked|mentioned", "mentioned")
+    .option("-n, --note <note>")
+    .option("--near <lat,lng>")
+    .option("--companions <names>")
+    .action(manualRememberAction);
+}
+
+function addDebugCommands(parent: Command) {
+  cmd(parent, "intent <query>")
+    .description("Resolve a maps query into its latent intent frame.")
+    .action(intentAction);
+
+  cmd(parent, "ask <question>")
+    .description('Infer a preference from behavior, e.g. "do I like coffee?".')
+    .action(askAction);
+
+  cmd(parent, "infer <concept>")
+    .description("Infer confidence that the user likes/avoids a concept.")
+    .option("-p, --predicate <p>", "likes|avoids|prefers", "likes")
+    .action(inferAction);
+
+  cmd(parent, "beliefs")
+    .description("List semantic belief edges.")
+    .option("-p, --predicate <p>")
+    .option("--min <conf>", "minimum confidence")
+    .action(beliefsAction);
+
+  cmd(parent, "graph")
+    .description("Dump the personal knowledge graph.")
+    .option("--mermaid", "render as Mermaid instead of JSON")
+    .action(graphAction);
+
+  cmd(parent, "events")
+    .description("List episodic events from L0/L1.")
+    .option("--kind <kind>")
+    .option("--concept <concept>")
+    .option("-l, --limit <n>", "max", "50")
+    .action(eventsAction);
+
+  cmd(parent, "profile")
+    .description("Taste profile: persona, top beliefs, favorites, stats.")
+    .action(profileAction);
+
+  cmd(parent, "anchors")
+    .description("Learned spatial self-model: home, work, usual area, near radius.")
+    .action(anchorsAction);
+
+  cmd(parent, "calibrations")
+    .description("Learned fuzzy-term meanings: near, walk_time, budget, noise, crowd, transit_walk.")
+    .action(calibrationsAction);
+
+  cmd(parent, "regions")
+    .description("Areas the user is active in.")
+    .action(regionsAction);
+
+  cmd(parent, "scenarios")
+    .description("List L2 scenario summaries.")
+    .option("-l, --limit <n>", "max scenarios", "20")
+    .option("--place <placeId>", "filter by place id")
+    .option("--intent <intent>", "filter by intent/goal")
+    .action(scenariosAction);
+
+  cmd(parent, "routines")
+    .description("List long-horizon routines derived from repeated scenarios.")
+    .option("-l, --limit <n>", "max routines", "20")
+    .option("--scenario-limit <n>", "max recent scenarios to roll up", "200")
+    .option("--min-scenarios <n>", "minimum scenarios per routine", "2")
+    .option("--intent <intent>", "filter by intent/goal")
+    .option("--concept <concept>", "filter by concept")
+    .action(routinesAction);
+
+  cmd(parent, "config")
+    .description("Show resolved local configuration.")
+    .action(configAction);
+}
+
+function addPersonaCommands(parent: Command) {
+  parent.description("Manual persona overrides.");
+  cmd(parent, "show").action(async () => emit((await openMap()).getPersona(user())));
+  cmd(parent, "set")
+    .description("Merge explicit preference overrides. Lists are comma-separated.")
+    .option("--likes <csv>").option("--dislikes <csv>").option("--vibes <csv>")
+    .option("--dietary <csv>").option("--budget <level>", "low|mid|high").option("--notes <text>")
+    .action(async (o) => {
+      const patch = personaPrefsSchema.parse({
+        ...(o.likes !== undefined ? { likes: list(o.likes) } : {}),
+        ...(o.dislikes !== undefined ? { dislikes: list(o.dislikes) } : {}),
+        ...(o.vibes !== undefined ? { vibes: list(o.vibes) } : {}),
+        ...(o.dietary !== undefined ? { dietary: list(o.dietary) } : {}),
+        ...(o.budget !== undefined ? { budget: o.budget } : {}),
+        ...(o.notes !== undefined ? { notes: o.notes } : {}),
+      });
+      emit((await openMap()).setPersona(user(), patch));
     });
-    emit({ stored: out.length, memories: out.map((m) => ({ id: m.id, placeId: m.placeId, relationship: m.relationship, affect: m.affect })) });
+  cmd(parent, "clear").action(async () => {
+    (await openMap()).clearPersona(user());
+    emit({ cleared: true, user: user() });
   });
+}
 
-program
-  .command("recall <query>")
-  .description("Search your remembered places by resolved intent (taste + vibe + proximity)")
-  .option("--near <lat,lng>")
-  .option("-l, --limit <n>", "max results", "5")
-  .action(async (query: string, o) => {
-    const om = buildOpenMap();
-    const frame = await om.resolveIntent(query);
-    const results = await om.recall(query, parseNear(o.near), Number(o.limit), user());
-    emit({ query, frame, results: scored(results) });
+function addMemoryCommands(parent: Command) {
+  parent.description("Manual memory management.");
+  cmd(parent, "list")
+    .option("-r, --relationship <rel>")
+    .option("-l, --limit <n>", "max", "50")
+    .action(async (o) => {
+      const items = (await openMap()).listMemories(user(), {
+        relationship: o.relationship ? relationshipSchema.parse(o.relationship) : undefined,
+        limit: Number(o.limit ?? 50),
+      });
+      emit({
+        count: items.length,
+        memories: items.map((it) => ({
+          id: it.memory.id,
+          relationship: it.memory.relationship,
+          affect: it.memory.affect,
+          note: it.memory.note,
+          sourceRefs: it.memory.sourceRefs ?? [],
+          place: it.place ? placeBrief(it.place) : null,
+        })),
+      });
+    });
+  cmd(parent, "forget")
+    .option("--id <memoryId>")
+    .option("--place <placeId>")
+    .action(async (o) => emit({ removed: (await openMap()).forget(user(), { memoryId: o.id ? Number(o.id) : undefined, placeId: o.place }) }));
+  cmd(parent, "update <id>")
+    .option("-r, --relationship <rel>")
+    .option("-n, --note <note>")
+    .action(async (id: string, o) =>
+      emit({ updated: (await openMap()).updateMemory(Number(id), { relationship: o.relationship ? relationshipSchema.parse(o.relationship) : undefined, note: o.note }) }),
+    );
+  cmd(parent, "export").action(async () => emit((await openMap()).exportMemories(user())));
+  cmd(parent, "import <file>").action(async (file: string) => emit({ imported: await (await openMap()).importMemories(JSON.parse(await readFile(file, "utf-8")), user()) }));
+}
+
+function addPlacesCommands(parent: Command) {
+  parent.description("Manual place browsing and canonicalization.");
+  cmd(parent, "list")
+    .option("--tag <tag>")
+    .option("-l, --limit <n>", "max", "50")
+    .action(async (o) => {
+      const ps = (await openMap()).listPlaces(user(), { tag: o.tag, limit: Number(o.limit ?? 50) });
+      emit({ count: ps.length, places: ps.map(placeBrief) });
+    });
+  cmd(parent, "related <placeId>")
+    .description("Place-to-place relations: near and similar.")
+    .option("-l, --limit <n>", "max", "5")
+    .action(async (placeId: string, o) => emit({ related: (await openMap()).relatedPlaces(placeId, { limit: Number(o.limit ?? 5) }) }));
+  cmd(parent, "home <placeId>")
+    .description("Mark a place as the user's home.")
+    .action(async (placeId: string) => emit((await openMap()).setPlaceRole(user(), placeId, "home")));
+  cmd(parent, "work <placeId>")
+    .description("Mark a place as the user's work.")
+    .action(async (placeId: string) => emit((await openMap()).setPlaceRole(user(), placeId, "work")));
+  cmd(parent, "alias <alias> <placeId>")
+    .description("Resolve future mentions of an alias to an existing canonical place.")
+    .action(async (alias: string, placeId: string) => emit({ alias: (await openMap()).addPlaceAlias(user(), alias, placeId) }));
+  cmd(parent, "aliases [placeId]")
+    .description("List per-user place aliases, optionally for one canonical place.")
+    .action(async (placeId?: string) => emit({ aliases: (await openMap()).placeAliases(user(), placeId) }));
+}
+
+function addCollectionCommands(parent: Command) {
+  parent.description("Manual named place lists.");
+  cmd(parent, "list").action(async () => emit({ collections: (await openMap()).collectionList(user()) }));
+  cmd(parent, "add <name> <placeId>").action(async (name: string, placeId: string) => {
+    (await openMap()).collectionAdd(user(), name, placeId);
+    emit({ added: { collection: name, placeId } });
   });
-
-program
-  .command("intent <query>")
-  .description("Resolve a maps query into its latent situational intent frame")
-  .action(async (query: string) => emit(await buildOpenMap().resolveIntent(query)));
-
-program
-  .command("observe <file>")
-  .description("Auto-capture memory from a conversation JSON: [{role,content}, …]. Extracts + reconciles place mentions.")
-  .action(async (file: string) => {
-    const turns = JSON.parse(await readFile(file, "utf-8"));
-    emit(await buildOpenMap().observe(turns, { userId: user() }));
+  cmd(parent, "remove <name> <placeId>").action(async (name: string, placeId: string) => emit({ removed: (await openMap()).collectionRemove(user(), name, placeId) }));
+  cmd(parent, "show <name>").action(async (name: string) => {
+    const ps = (await openMap()).collectionShow(user(), name);
+    emit({ collection: name, count: ps.length, places: ps.map(placeBrief) });
   });
+}
 
-// ---- agent hooks (auto-capture / auto-recall) ------------------------------
-program
-  .command("capture <file>")
-  .description("auto-capture: log raw turns to L0 (for grounding) + extract memory. Conversation JSON: [{role,content}, …].")
-  .option("--no-extract", "only log raw turns (defer LLM extraction to a cadence)")
-  .action(async (file: string, o) => {
-    const turns = JSON.parse(await readFile(file, "utf-8"));
-    emit(await buildOpenMap().capture(turns, { userId: user(), extract: o.extract }));
-  });
+function addManualCommands(parent: Command) {
+  addManualRememberCommand(parent, "remember");
+  cmd(parent, "extract <file>")
+    .description("Run extraction/reconciliation without recording raw L0 turns.")
+    .action(extractAction);
+  cmd(parent, "learn-near <km>")
+    .description("Teach the user's near tolerance from an accepted distance.")
+    .action(learnNearAction);
+  cmd(parent, "calibrate <term> <value>")
+    .description("Teach what a fuzzy term means. term: near|walk_time|budget|noise|crowd|transit_walk")
+    .option("--context <c>", "scope to a context, e.g. a goal like date")
+    .action(calibrateAction);
+  cmd(parent, "consolidate")
+    .description("Promote behavior into persisted beliefs.")
+    .action(consolidateAction);
+  cmd(parent, "repair-contradictions")
+    .description("Repair old inferred graph contradictions.")
+    .action(repairContradictionsAction);
 
-program
-  .command("recall-context <query>")
-  .description("auto-recall: build injectable context — persona block (system) + relevant places (prepend). For agent turn loops.")
-  .option("--near <lat,lng>")
-  .option("-l, --limit <n>", "max recalled places", "5")
-  .action(async (query: string, o) => {
-    const ctx = await buildOpenMap().recallContext(query, { near: parseNear(o.near), limit: Number(o.limit), userId: user() });
-    emit({ query, system: ctx.system, prepend: ctx.prepend, places: scored(ctx.places), sources: ctx.sources });
-  });
+  addPersonaCommands(cmd(parent, "persona"));
+  addMemoryCommands(cmd(parent, "memory"));
+  addPlacesCommands(cmd(parent, "places"));
+  addCollectionCommands(cmd(parent, "collection"));
+}
 
-program
-  .command("conversation <query>")
-  .description("Search the raw L0 conversation log (BM25) — recall original wording to ground a memory.")
-  .option("-l, --limit <n>", "max turns", "10")
-  .action((query: string, o) => emit({ query, turns: buildOpenMap().searchConversation(query, { userId: user(), limit: Number(o.limit) }) }));
+// ---- primary CLI -----------------------------------------------------------
+addObserveCommand(program, "observe");
+addContextCommand(program, "context");
+addSearchCommand(program, "search");
+addEvidenceCommand(program, "evidence");
 
-program
-  .command("scenarios")
-  .description("List L2 scenario summaries grouped from captured turns, places, concepts, and intents")
+const debug = cmd(program, "debug").description("Inspect derived memory state.");
+addDebugCommands(debug);
+
+const manual = cmd(program, "manual").description("Manual overrides for tests/admin. Agents should usually not use this.");
+addManualCommands(manual);
+
+cmd(program, "config")
+  .description("Show resolved local configuration.")
+  .action(configAction);
+
+cmd(program, "serve")
+  .description("Run the MCP server so agents can use openmap as tools.")
+  .action(serveAction);
+
+// ---- legacy compatibility aliases (hidden from help) -----------------------
+addObserveCommand(program, "capture", true);
+addContextCommand(program, "recall-context", true);
+addSearchCommand(program, "recall", true);
+addEvidenceCommand(program, "conversation", true);
+addManualRememberCommand(program, "remember", true);
+cmd(program, "intent <query>", true).action(intentAction);
+cmd(program, "ask <question>", true).action(askAction);
+cmd(program, "infer <concept>", true).option("-p, --predicate <p>", "likes|avoids|prefers", "likes").action(inferAction);
+cmd(program, "consolidate", true).action(consolidateAction);
+cmd(program, "repair-contradictions", true).action(repairContradictionsAction);
+cmd(program, "beliefs", true).option("-p, --predicate <p>").option("--min <conf>", "minimum confidence").action(beliefsAction);
+cmd(program, "graph", true).option("--mermaid", "render as Mermaid instead of JSON").action(graphAction);
+cmd(program, "events", true).option("--kind <kind>").option("--concept <concept>").option("-l, --limit <n>", "max", "50").action(eventsAction);
+cmd(program, "profile", true).action(profileAction);
+cmd(program, "anchors", true).action(anchorsAction);
+cmd(program, "learn-near <km>", true).action(learnNearAction);
+cmd(program, "calibrate <term> <value>", true).option("--context <c>", "scope to a context").action(calibrateAction);
+cmd(program, "calibrations", true).action(calibrationsAction);
+cmd(program, "regions", true).action(regionsAction);
+cmd(program, "scenarios", true)
   .option("-l, --limit <n>", "max scenarios", "20")
   .option("--place <placeId>", "filter by place id")
   .option("--intent <intent>", "filter by intent/goal")
-  .action((o) => emit({ scenarios: buildOpenMap().scenarios(user(), { limit: Number(o.limit), placeId: o.place, intent: o.intent }) }));
-
-program
-  .command("routines")
-  .description("List long-horizon routines derived from repeated scenarios")
+  .action(scenariosAction);
+cmd(program, "routines", true)
   .option("-l, --limit <n>", "max routines", "20")
   .option("--scenario-limit <n>", "max recent scenarios to roll up", "200")
   .option("--min-scenarios <n>", "minimum scenarios per routine", "2")
   .option("--intent <intent>", "filter by intent/goal")
   .option("--concept <concept>", "filter by concept")
-  .action((o) =>
-    emit({
-      routines: buildOpenMap().routines(user(), {
-        limit: Number(o.limit),
-        scenarioLimit: Number(o.scenarioLimit),
-        minScenarios: Number(o.minScenarios),
-        intent: o.intent,
-        concept: o.concept,
-      }),
-    }),
-  );
-
-// ---- inference -------------------------------------------------------------
-program
-  .command("ask <question>")
-  .description('Infer a preference from behavior, e.g. "do I like coffee?"')
-  .action((question: string) => emit(buildOpenMap().ask(question, user())));
-
-program
-  .command("infer <concept>")
-  .description("Infer confidence that the user likes/avoids a concept")
-  .option("-p, --predicate <p>", "likes|avoids|prefers", "likes")
-  .action((concept: string, o) => emit(buildOpenMap().infer(concept, o.predicate as Predicate, user())));
-
-program
-  .command("consolidate")
-  .description("Promote behavior (events) into persisted beliefs (L0/L1 → L2)")
-  .action(() => emit({ written: buildOpenMap().consolidate(user()) }));
-
-program
-  .command("repair-contradictions")
-  .description("Repair old inferred graph contradictions, e.g. both likes and avoids the same concept")
-  .action(() => emit({ repaired: buildOpenMap().repairContradictions(user()) }));
-
-program
-  .command("beliefs")
-  .description("List the user's semantic beliefs (the personal knowledge graph edges)")
-  .option("-p, --predicate <p>")
-  .option("--min <conf>", "minimum confidence")
-  .action((o) => emit({ beliefs: buildOpenMap().beliefs(user(), { predicate: o.predicate, minConfidence: o.min ? Number(o.min) : undefined }) }));
-
-program
-  .command("graph")
-  .description("Dump the user's personal knowledge graph (nodes + edges, or Mermaid)")
-  .option("--mermaid", "render as a Mermaid diagram instead of JSON")
-  .action((o) => {
-    const om = buildOpenMap();
-    if (o.mermaid) console.log(om.graphMermaid(user()));
-    else emit(om.graph(user()));
-  });
-
-program
-  .command("events")
-  .description("List the user's episodic event log (L0)")
-  .option("--kind <kind>")
-  .option("--concept <concept>")
-  .option("-l, --limit <n>", "max", "50")
-  .action((o) => emit({ events: buildOpenMap().listEvents(user(), { kind: o.kind, concept: o.concept, limit: Number(o.limit) }) }));
-
-program
-  .command("profile")
-  .description("Taste profile: persona, top beliefs, favorites, stats")
-  .action(() => emit(buildOpenMap().tasteProfile(user())));
-
-program
-  .command("anchors")
-  .description("The user's learned spatial self-model (home / work / usual area / 'near' radius)")
-  .action(() => emit(buildOpenMap().anchors(user())));
-
-program
-  .command("learn-near <km>")
-  .description("Teach the user's 'near' tolerance from an accepted distance (e.g. picked a place 3km away)")
-  .action((km: string) => {
-    const om = buildOpenMap();
-    om.learn(user(), "near", Number(km));
-    emit(om.anchors(user()));
-  });
-
-program
-  .command("calibrate <term> <value>")
-  .description("Teach what a fuzzy term means to this user. term: near|walk_time|budget|noise|crowd|transit_walk")
-  .option("--context <c>", "scope to a context, e.g. a goal like 'date' (near-for-a-date ≠ near-for-coffee)")
-  .action((term: string, value: string, o) => {
-    const om = buildOpenMap();
-    om.learn(user(), term, Number(value), o.context);
-    emit({ calibrations: om.calibrations(user()) });
-  });
-
-program
-  .command("calibrations")
-  .description("Show the user's learned meaning of fuzzy terms (near/walk_time/budget/noise/crowd/transit_walk)")
-  .action(() => emit({ calibrations: buildOpenMap().calibrations(user()) }));
-
-program
-  .command("regions")
-  .description("Areas the user is active in (user↔area relationship), clustered from place activity")
-  .action(() => emit({ regions: buildOpenMap().regions(user()) }));
-
-// ---- persona ---------------------------------------------------------------
-const persona = program.command("persona").description("Manage explicit preferences");
-persona.command("show").action(() => emit(buildOpenMap().getPersona(user())));
-persona
-  .command("set")
-  .description("Merge preferences (provided fields replace). Lists are comma-separated.")
-  .option("--likes <csv>").option("--dislikes <csv>").option("--vibes <csv>")
-  .option("--dietary <csv>").option("--budget <level>", "low|mid|high").option("--notes <text>")
-  .action((o) => {
-    const patch = personaPrefsSchema.parse({
-      ...(o.likes !== undefined ? { likes: list(o.likes) } : {}),
-      ...(o.dislikes !== undefined ? { dislikes: list(o.dislikes) } : {}),
-      ...(o.vibes !== undefined ? { vibes: list(o.vibes) } : {}),
-      ...(o.dietary !== undefined ? { dietary: list(o.dietary) } : {}),
-      ...(o.budget !== undefined ? { budget: o.budget } : {}),
-      ...(o.notes !== undefined ? { notes: o.notes } : {}),
-    });
-    emit(buildOpenMap().setPersona(user(), patch));
-  });
-persona.command("clear").action(() => { buildOpenMap().clearPersona(user()); emit({ cleared: true, user: user() }); });
-
-// ---- memory management -----------------------------------------------------
-const memory = program.command("memory").description("Manage stored memories");
-memory
-  .command("list").option("-r, --relationship <rel>").option("-l, --limit <n>", "max", "50")
-  .action((o) => {
-    const items = buildOpenMap().listMemories(user(), { relationship: o.relationship ? relationshipSchema.parse(o.relationship) : undefined, limit: Number(o.limit) });
-    emit({ count: items.length, memories: items.map((it) => ({ id: it.memory.id, relationship: it.memory.relationship, affect: it.memory.affect, note: it.memory.note, sourceRefs: it.memory.sourceRefs ?? [], place: it.place ? placeBrief(it.place) : null })) });
-  });
-memory
-  .command("forget").option("--id <memoryId>").option("--place <placeId>")
-  .action((o) => emit({ removed: buildOpenMap().forget(user(), { memoryId: o.id ? Number(o.id) : undefined, placeId: o.place }) }));
-memory
-  .command("update <id>").option("-r, --relationship <rel>").option("-n, --note <note>")
-  .action((id: string, o) => emit({ updated: buildOpenMap().updateMemory(Number(id), { relationship: o.relationship ? relationshipSchema.parse(o.relationship) : undefined, note: o.note }) }));
-memory.command("export").action(() => emit(buildOpenMap().exportMemories(user())));
-memory.command("import <file>").action(async (file: string) => emit({ imported: await buildOpenMap().importMemories(JSON.parse(await readFile(file, "utf-8")), user()) }));
-
-// ---- places + collections --------------------------------------------------
-const places = program.command("places").description("Browse places + place relations");
-places.command("list").option("--tag <tag>").option("-l, --limit <n>", "max", "50")
-  .action((o) => { const ps = buildOpenMap().listPlaces(user(), { tag: o.tag, limit: Number(o.limit) }); emit({ count: ps.length, places: ps.map(placeBrief) }); });
-places.command("related <placeId>").description("Place↔place relations (near + similar)").option("-l, --limit <n>", "max", "5")
-  .action((placeId: string, o) => emit({ related: buildOpenMap().relatedPlaces(placeId, { limit: Number(o.limit) }) }));
-places.command("home <placeId>").description("Mark a place as the user's home (lives_near)").action((placeId: string) => emit(buildOpenMap().setPlaceRole(user(), placeId, "home")));
-places.command("work <placeId>").description("Mark a place as the user's work (works_near)").action((placeId: string) => emit(buildOpenMap().setPlaceRole(user(), placeId, "work")));
-places.command("alias <alias> <placeId>").description("Add a per-user alias that resolves future mentions to an existing canonical place")
-  .action((alias: string, placeId: string) => emit({ alias: buildOpenMap().addPlaceAlias(user(), alias, placeId) }));
-places.command("aliases [placeId]").description("List per-user place aliases, optionally for one canonical place")
-  .action((placeId?: string) => emit({ aliases: buildOpenMap().placeAliases(user(), placeId) }));
-
-const collection = program.command("collection").description("Named place lists / saved searches");
-collection.command("list").action(() => emit({ collections: buildOpenMap().collectionList(user()) }));
-collection.command("add <name> <placeId>").action((name: string, placeId: string) => { buildOpenMap().collectionAdd(user(), name, placeId); emit({ added: { collection: name, placeId } }); });
-collection.command("remove <name> <placeId>").action((name: string, placeId: string) => emit({ removed: buildOpenMap().collectionRemove(user(), name, placeId) }));
-collection.command("show <name>").action((name: string) => { const ps = buildOpenMap().collectionShow(user(), name); emit({ collection: name, count: ps.length, places: ps.map(placeBrief) }); });
-
-// ---- misc ------------------------------------------------------------------
-program
-  .command("config")
-  .action(() => {
-    const c = loadConfig();
-    emit({
-      dbPath: c.dbPath, embedder: resolvedEmbedder(c), tagger: resolvedTagger(c),
-      openaiKey: Boolean(c.openaiApiKey), baseUrl: c.openaiBaseUrl,
-      llm: c.openaiApiKey ? (c.openaiBaseUrl ? "openai-compatible (BYOC)" : "openai") : "offline (inject a runner to use a model)",
-    });
-  });
-
-program
-  .command("serve-mcp")
-  .description("Run the MCP server so agents can use openmap as tools")
-  .action(async () => { const { main } = await import("./mcp.js"); await main(); });
+  .action(routinesAction);
+cmd(program, "serve-mcp", true).action(serveAction);
+addPersonaCommands(cmd(program, "persona", true));
+addMemoryCommands(cmd(program, "memory", true));
+addPlacesCommands(cmd(program, "places", true));
+addCollectionCommands(cmd(program, "collection", true));
 
 program.parseAsync().catch((err) => {
   console.error(JSON.stringify({ error: String(err?.message ?? err) }));
