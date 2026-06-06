@@ -8,7 +8,8 @@ import { type DB } from "../store/db.js";
  * evidence, and resolve queries against it.
  *
  * Aggregation per term:
- *  - "max": a tolerance ceiling — the largest accepted value (near, walk_time).
+ *  - "max": a tolerance ceiling — the largest accepted value (near, walk_time,
+ *    noise, crowd, transit_walk).
  *  - "min": a floor — the smallest accepted value.
  *  - "ema": a running typical value (budget, noise level).
  */
@@ -25,7 +26,9 @@ export const TERMS: Record<string, TermSpec> = {
   near: { defaultValue: 2, agg: "max", unit: "km", note: "radius the user accepts as 'near'" },
   walk_time: { defaultValue: 10, agg: "max", unit: "min", note: "how long they'll walk" },
   budget: { defaultValue: null, agg: "ema", unit: "ccy", note: "typical accepted spend" },
-  noise: { defaultValue: 0.5, agg: "ema", unit: "0..1", note: "tolerated noise/crowd level" },
+  noise: { defaultValue: 0.35, agg: "max", unit: "0..1", note: "highest accepted ambient noise level" },
+  crowd: { defaultValue: 0.35, agg: "max", unit: "0..1", note: "highest accepted crowd level" },
+  transit_walk: { defaultValue: 8, agg: "max", unit: "min", note: "walk time from transit the user accepts" },
 };
 
 export interface Calibration {

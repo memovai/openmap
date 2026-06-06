@@ -1,27 +1,32 @@
 import { type Config, loadConfig } from "./core/config.js";
 import { DB, type CollectionInfo, type MemoryListItem, type StoredTurn, buildFtsMatch } from "./store/db.js";
-import { type Embedder, cosineMatrix, getEmbedder } from "./nlp/embedding.js";
+import { type Embedder, getEmbedder } from "./nlp/embedding.js";
 import { type Extractor, type Measure, conceptsFromTags, extractConcepts, getExtractor } from "./nlp/extract.js";
 import { type MemoryExtractor, HeuristicMemoryExtractor, getMemoryExtractor } from "./nlp/memory-extractor.js";
-import { type Tagger, getTagger } from "./nlp/tagger.js";
+import { type Tagger, getTagger, lexiconFrame } from "./nlp/tagger.js";
 import { type LLMRunner, getRunner } from "./nlp/llm.js";
 import {
   type Inference,
+  type RepairAction,
   type ReconcileAction,
   ask,
   consolidate,
   decayConfidence,
   inferConcept,
+  repairContradictions,
   reconcileDecision,
 } from "./memory/inference.js";
-import { tasteVector as tasteVectorOf, effectiveTaste } from "./memory/taste.js";
-import { type Anchors, computeAnchors, defaultAnchor } from "./memory/anchors.js";
+import { tasteVector as tasteVectorOf } from "./memory/taste.js";
+import { type Anchors, computeAnchors } from "./memory/anchors.js";
 import { type Area, frequentedAreas } from "./memory/regions.js";
-import { type Calibration, allCalibrations, learnCalibration, nearRadiusKm } from "./memory/calibration.js";
+import { type Calibration, allCalibrations, learnCalibration } from "./memory/calibration.js";
 import { buildGraph, graphToMermaid, type KnowledgeGraph } from "./memory/graph.js";
-import { rankMemory, rrfMerge } from "./search/ranking.js";
-import { formatPersonaContext, formatRecallBlock } from "./memory/hooks.js";
+import { type RankingBeliefSignals } from "./search/ranking.js";
+import { recallPlaces } from "./search/recall.js";
+import { formatPersonaContext, formatRecallBlock, type RecallBlockSource } from "./memory/hooks.js";
 import { type RelatedPlace, relatedPlaces as relatedPlacesOf } from "./world/relations.js";
+import { ALLOWED_GOALS } from "./prompts/intent.js";
+import { canonicalConcepts, createScenarioFromObservation, deriveRoutines } from "./memory/scenarios.js";
 import {
   DEFAULT_USER,
   type Belief,
@@ -32,9 +37,13 @@ import {
   type Persona,
   type PersonaPrefs,
   type Place,
+  type PlaceAlias,
   type Predicate,
+  type ProvenanceRef,
   type RawPlace,
   type Relationship,
+  type Routine,
+  type Scenario,
   type ScoredPlace,
   affectFor,
   emptyPrefs,
@@ -49,7 +58,6 @@ export type { Anchors } from "./memory/anchors.js";
 export type { KnowledgeGraph } from "./memory/graph.js";
 
 const round = (x: number, n = 3) => Number(x.toFixed(n));
-
 export interface RememberOptions {
   userId?: string;
   relationship?: Relationship;
@@ -57,6 +65,7 @@ export interface RememberOptions {
   near?: GeoPoint | null;
   companions?: string[];
   source?: string;
+  sourceRefs?: ProvenanceRef[];
 }
 export interface MemoryExport {
   userId: string;
@@ -74,11 +83,16 @@ export interface ObserveResult {
   actions: Array<{ place: string; placeId: string; action: ReconcileAction; relationship: Relationship; reason: string }>;
   /** Calibrations auto-learned from accepted measures in the conversation. */
   learned: Measure[];
+  /** Episode-level concepts extracted from the observed user turns and places. */
+  concepts: string[];
+  /** Episode-level intents/goals extracted from the observed user turns. */
+  intents: string[];
 }
 /** auto-capture result: raw turns persisted to L0 + the extraction outcome. */
 export interface CaptureResult {
   recorded: number; // raw turns written to the L0 log
   observed: ObserveResult | null; // null when extraction was deferred (extract:false)
+  scenario: Scenario | null; // L2 episode grouping the captured turns + map memories
 }
 /** auto-recall result: ready-to-inject context for the host's turn loop. */
 export interface RecallContext {
@@ -88,7 +102,10 @@ export interface RecallContext {
   prepend: string;
   /** The underlying ranked places (for hosts that want structured data). */
   places: ScoredPlace[];
+  /** Raw L0 turns that justify each recalled place, keyed by place id. */
+  sources: Record<string, RecallSource[]>;
 }
+export type RecallSource = RecallBlockSource;
 
 const ACCEPTING = new Set<Relationship>(["visited", "loved", "liked", "want_to_go"]);
 const REJECTION_RE = /too far|too expensive|too pricey|too long|not worth|too much|skip it/i;
@@ -110,14 +127,19 @@ export class OpenMap {
     private memExtractor: MemoryExtractor = new HeuristicMemoryExtractor(),
   ) {}
 
-  private logEvent(e: Omit<OmEvent, "id" | "createdAt">): void {
-    this.db.addEvent({ ...e, id: null, createdAt: nowIso() });
+  private logEvent(e: Omit<OmEvent, "id" | "createdAt">): number {
+    return this.db.addEvent({ ...e, id: null, createdAt: nowIso() });
   }
 
   /** Build a place from a conversation mention. No POI lookup — but the name
    * itself is evidence (a place called "Blue Bottle Coffee" implies coffee), so
    * we tag it with concepts derived from its name. */
-  private placeFromMention(name: string): Place {
+  private placeFromMention(name: string, userId = DEFAULT_USER): Place {
+    const aliasTarget = this.db.resolvePlaceAlias(userId, name);
+    if (aliasTarget) {
+      const canonical = this.db.getPlace(aliasTarget);
+      if (canonical) return canonical;
+    }
     const p = rawToPlace(mentionToPlace(name));
     if (p.tags.length === 0) p.tags = extractConcepts(name);
     return p;
@@ -130,13 +152,14 @@ export class OpenMap {
     const textConcepts = await this.tagger.concepts(text);
     const out: Memory[] = [];
     for (const mention of mentions) {
-      const place = this.placeFromMention(mention);
+      const place = this.placeFromMention(mention, userId);
       const mem = await this.store(place, {
         userId,
         relationship: opts.relationship ?? "mentioned",
         note: opts.note ?? text,
         companions: opts.companions ?? [],
         source: opts.source ?? "manual",
+        sourceRefs: opts.sourceRefs ?? [{ kind: "stated", id: null, label: opts.source ?? "manual", snippet: text.slice(0, 220) }],
       });
       this.logEvent({
         userId, kind: "remember", text, placeId: place.id,
@@ -156,6 +179,7 @@ export class OpenMap {
       note: opts.note ?? null,
       companions: opts.companions ?? [],
       source: opts.source ?? "manual",
+      sourceRefs: opts.sourceRefs ?? [{ kind: "stated", id: null, label: opts.source ?? "manual" }],
     });
     this.logEvent({ userId, kind: "remember", text: place.name, placeId: place.id, concepts: conceptsFromTags(place.tags), intents: [] });
     return mem;
@@ -163,14 +187,17 @@ export class OpenMap {
 
   private async store(
     place: Place,
-    o: Required<Pick<RememberOptions, "userId" | "relationship" | "note" | "companions" | "source">>,
+    o: Required<Pick<RememberOptions, "userId" | "relationship" | "note" | "companions" | "source">> & { sourceRefs?: ProvenanceRef[] },
   ): Promise<Memory> {
     const emb = this.embedder ? await this.embedder.embedOne(placeTextBlob(place)) : null;
     this.db.upsertPlace(place, emb);
+    this.db.addPlaceAlias(o.userId, place.name, place.id);
+    for (const alias of Array.isArray(place.raw.aliases) ? place.raw.aliases : [])
+      if (typeof alias === "string" && alias.trim()) this.db.addPlaceAlias(o.userId, alias, place.id);
     const mem: Memory = {
       id: null, userId: o.userId, placeId: place.id, relationship: o.relationship,
       affect: affectFor(o.relationship), note: o.note, companions: o.companions,
-      occurredAt: null, createdAt: nowIso(), source: o.source,
+      occurredAt: null, createdAt: nowIso(), source: o.source, sourceRefs: o.sourceRefs ?? [],
     };
     mem.id = this.db.addMemory(mem);
     return mem;
@@ -182,15 +209,19 @@ export class OpenMap {
    * against existing memory — ADD / UPDATE (want_to_go → visited, sentiment flip)
    * / NOOP — instead of blindly appending. LLM mention extraction when keyed.
    */
-  async observe(turns: ConversationTurn[], opts: { userId?: string } = {}): Promise<ObserveResult> {
+  async observe(turns: ConversationTurn[], opts: { userId?: string; recordedTurns?: StoredTurn[] } = {}): Promise<ObserveResult> {
     const userId = opts.userId ?? DEFAULT_USER;
     const actions: ObserveResult["actions"] = [];
     const learned: Measure[] = [];
+    const observedConcepts = new Set<string>();
+    const observedIntents = new Set<string>();
     let userTurns = 0;
     let prev = ""; // previous turn (often the agent offering options with distances/prices)
+    let recordedCursor = 0;
 
     for (const turn of turns) {
       const text = turn.content?.trim() ?? "";
+      const recorded = text ? opts.recordedTurns?.[recordedCursor++] : undefined;
       if ((turn.role ?? "user") !== "user") {
         if (text) prev = text;
         continue;
@@ -198,19 +229,31 @@ export class OpenMap {
       if (!text) continue;
       userTurns++;
       const frame = await this.tagger.frame(text);
+      const lexicalGoals = lexiconFrame(text).goals;
+      const goals = [...new Set([...frame.goals, ...lexicalGoals])];
+      for (const c of canonicalConcepts([...frame.concepts, ...frame.vibe])) observedConcepts.add(c);
+      for (const g of goals) observedIntents.add(g);
       this.logEvent({
         userId, kind: "state", text, placeId: null,
-        concepts: [...new Set([...frame.concepts, ...frame.vibe])], intents: frame.goals,
+        concepts: [...new Set([...frame.concepts, ...frame.vibe])], intents: goals,
       });
 
       const rejection = REJECTION_RE.test(`${prev} ${text}`);
       for (const ex of await this.memExtractor.extract(text, { context: prev })) {
-        const place = this.placeFromMention(ex.name);
-        if (ex.concepts?.length) place.tags = [...new Set([...place.tags, ...ex.concepts])]; // richer tags from LLM
+        const place = this.placeFromMention(ex.name, userId);
+        const exConcepts = canonicalConcepts(ex.concepts ?? []);
+        if (exConcepts.length) place.tags = [...new Set([...place.tags, ...exConcepts])]; // richer tags from LLM
+        const goalContexts = [...new Set([ex.goal, ...goals].filter((g): g is string => !!g && ALLOWED_GOALS.includes(g)))];
+        if (goalContexts.length) place.tags = [...new Set([...place.tags, ...goalContexts])]; // place-side affordance learned from the user's situation
+        for (const c of [...exConcepts, ...conceptsFromTags(place.tags)]) observedConcepts.add(c);
+        for (const g of goalContexts) observedIntents.add(g);
         const existing = this.db.memoriesFor(place.id, userId);
         const decision = reconcileDecision(existing, ex.relationship);
+        const sourceRefs: ProvenanceRef[] = recorded
+          ? [{ kind: "turn", id: recorded.id, label: recorded.role, snippet: recorded.content.replace(/\s+/g, " ").slice(0, 220) }]
+          : [{ kind: "stated", id: null, label: "observe", snippet: text.slice(0, 220) }];
         if (decision.action === "add") {
-          await this.store(place, { userId, relationship: ex.relationship, note: text, companions: ex.companions, source: "observe" });
+          await this.store(place, { userId, relationship: ex.relationship, note: text, companions: ex.companions, source: "observe", sourceRefs });
         } else if (decision.action === "update" && decision.targetId != null) {
           this.db.upsertPlace(place, this.embedder ? await this.embedder.embedOne(placeTextBlob(place)) : null);
           this.db.updateMemory(decision.targetId, { relationship: ex.relationship, affect: affectFor(ex.relationship), note: text });
@@ -221,7 +264,8 @@ export class OpenMap {
         // revealed-preference calibration (per place, scoped to its intent context)
         if (ACCEPTING.has(ex.relationship) && !rejection) {
           for (const me of ex.measures) {
-            this.learn(userId, me.term, me.value, ex.goal ?? undefined);
+            const contexts = goalContexts.length ? goalContexts : [undefined];
+            for (const context of contexts) this.learn(userId, me.term, me.value, context);
             learned.push(me);
           }
         }
@@ -229,12 +273,16 @@ export class OpenMap {
         if (ex.region)
           this.db.upsertBelief({
             id: null, userId, subject: "user", predicate: "frequents", object: ex.region, otype: "region",
-            confidence: 0.6, support: [`observed: ${place.name}`], source: "inferred", updatedAt: nowIso(),
+            confidence: 0.6,
+            support: [`observed: ${place.name}`],
+            provenance: [{ kind: "place", id: place.id, label: `observed ${place.name}` }],
+            source: "inferred",
+            updatedAt: nowIso(),
           });
       }
       prev = text;
     }
-    return { userTurns, actions, learned };
+    return { userTurns, actions, learned, concepts: [...observedConcepts], intents: [...observedIntents] };
   }
 
   // ---- agent hooks (auto-capture / auto-recall) ---------------------------
@@ -246,13 +294,21 @@ export class OpenMap {
    */
   async capture(turns: ConversationTurn[], opts: { userId?: string; extract?: boolean } = {}): Promise<CaptureResult> {
     const userId = opts.userId ?? DEFAULT_USER;
-    const recorded = this.db.recordTurns(
+    const recordedTurns = this.db.recordTurnsDetailed(
       userId,
       turns.map((t) => ({ role: t.role ?? "user", content: t.content ?? "", at: t.at })),
       nowIso(),
     );
-    const observed = opts.extract === false ? null : await this.observe(turns, { userId });
-    return { recorded, observed };
+    const observed = opts.extract === false ? null : await this.observe(turns, { userId, recordedTurns });
+    const scenario = observed ? this.createScenario(userId, recordedTurns, observed) : null;
+    return { recorded: recordedTurns.length, observed, scenario };
+  }
+
+  private createScenario(userId: string, turns: StoredTurn[], observed: ObserveResult): Scenario | null {
+    const scenario = createScenarioFromObservation(userId, turns, observed);
+    if (!scenario) return null;
+    scenario.id = this.db.addScenario(scenario);
+    return scenario;
   }
 
   /**
@@ -266,8 +322,33 @@ export class OpenMap {
   ): Promise<RecallContext> {
     const userId = opts.userId ?? DEFAULT_USER;
     const places = await this.recall(query, opts.near ?? null, opts.limit ?? 5, userId);
+    const sources = Object.fromEntries(places.map((p) => [p.place.id, this.sourcesForPlace(userId, p.place)]));
     const system = formatPersonaContext(this.getPersona(userId), this.anchors(userId), this.calibrations(userId));
-    return { system, prepend: formatRecallBlock(places), places };
+    return { system, prepend: formatRecallBlock(places, sources), places, sources };
+  }
+
+  private sourcesForPlace(userId: string, place: Place, limit = 2): RecallSource[] {
+    const match = buildFtsMatch(place.name);
+    if (!match) return [];
+    const name = place.name.toLowerCase();
+    const hits = this.db
+      .searchTurns(userId, match, 20)
+      .filter((t) => t.content.toLowerCase().includes(name))
+      .sort((a, b) => Number(b.role === "user") - Number(a.role === "user"));
+    const seen = new Set<number>();
+    const out: RecallSource[] = [];
+    for (const h of hits) {
+      if (seen.has(h.id)) continue;
+      seen.add(h.id);
+      out.push({
+        turnId: h.id,
+        role: h.role,
+        at: h.at,
+        snippet: h.content.replace(/\s+/g, " ").slice(0, 220),
+      });
+      if (out.length >= limit) break;
+    }
+    return out;
   }
 
   /** Keyword (BM25) search over the raw L0 conversation log — lets the agent
@@ -281,6 +362,27 @@ export class OpenMap {
   /** Most recent raw turns from the L0 log (chronological). */
   recentConversation(opts: { userId?: string; limit?: number } = {}): StoredTurn[] {
     return this.db.recentTurns(opts.userId ?? DEFAULT_USER, opts.limit ?? 20);
+  }
+
+  /** L2 scenario summaries: one captured episode grouping raw turns, places,
+   * concepts, and intents. This is the bridge from L0 logs to the L3 persona. */
+  scenarios(userId = DEFAULT_USER, opts: { limit?: number; placeId?: string; intent?: string } = {}): Scenario[] {
+    return this.db.listScenarios(userId, opts);
+  }
+
+  /** Long-horizon routines derived from repeated L2 scenarios. These are not
+   * stored separately: they are replayable rollups from scenario history. */
+  routines(
+    userId = DEFAULT_USER,
+    opts: { limit?: number; scenarioLimit?: number; minScenarios?: number; intent?: string; concept?: string } = {},
+  ): Routine[] {
+    return deriveRoutines(this.db, userId, opts);
+  }
+
+  private strongestPlaceRelationship(userId: string, placeId: string): Relationship | null {
+    const memories = this.db.memoriesFor(placeId, userId);
+    if (memories.length === 0) return null;
+    return memories.reduce((a, b) => (Math.abs(b.affect) > Math.abs(a.affect) ? b : a)).relationship;
   }
 
   // ---- taste --------------------------------------------------------------
@@ -298,45 +400,37 @@ export class OpenMap {
    * logged as a behavioral event (it's conversation too), feeding inference.
    */
   async recall(query: string, near: GeoPoint | null = null, limit = 5, userId = DEFAULT_USER): Promise<ScoredPlace[]> {
-    const frame = await this.resolveIntent(query);
+    const prefs = this.db.getPersonaPrefs(userId).prefs ?? emptyPrefs();
+    const beliefSignals = this.rankingBeliefSignals(userId);
+    const { frame, places } = await recallPlaces({
+      db: this.db,
+      embedder: this.embedder,
+      tagger: this.tagger,
+      userId,
+      query,
+      near,
+      limit,
+      prefs,
+      beliefSignals,
+    });
     this.logEvent({
       userId, kind: "search", text: query, placeId: null,
       concepts: [...new Set([...frame.concepts, ...frame.vibe])], intents: frame.goals,
     });
-    const items = this.db.iterRemembered(userId);
-    if (items.length === 0) return [];
-    const remembered = new Set(items.map((i) => i.place.id));
-    const queryText = [frame.rawQuery, ...frame.vibe, ...frame.concepts, ...frame.goals].join(" ");
+    return places;
+  }
 
-    // keyword arm — FTS5/BM25 over place text, restricted to what the user remembers
-    const match = buildFtsMatch(queryText);
-    const kw = match ? this.db.searchPlaceFts(match, 50).filter((id) => remembered.has(id)) : [];
-
-    // vector arm — cosine over remembered embeddings (only if an embedder is set)
-    let vec: string[] = [];
-    let tasteSim: number[] = items.map(() => 0);
-    const prefs = this.db.getPersonaPrefs(userId).prefs ?? emptyPrefs();
-    const taste = await effectiveTaste(this.db, this.embedder, userId, prefs);
-    if (this.embedder && items.some((i) => i.embedding)) {
-      const qv = await this.embedder.embedOne(queryText);
-      const sims = cosineMatrix(qv, items.map((i) => i.embedding));
-      vec = items
-        .map((it, i) => ({ id: it.place.id, s: it.embedding ? sims[i]! : -1 }))
-        .filter((x) => x.s > 0)
-        .sort((a, b) => b.s - a.s)
-        .map((x) => x.id);
-      if (taste) tasteSim = cosineMatrix(taste, items.map((i) => i.embedding));
-    }
-
-    const relevance = rrfMerge([kw, vec]);
-    const anchor = near ?? defaultAnchor(this.db, userId);
-    const radius = nearRadiusKm(this.db, userId, frame.goals[0]); // near resolved per context
-    return rankMemory({ items, relevance, tasteSim, prefs, frame, near: anchor, nearRadiusKm: radius, limit });
+  private rankingBeliefSignals(userId: string): RankingBeliefSignals {
+    const terms = (predicate: Predicate) =>
+      this.beliefs(userId, { predicate, minConfidence: 0.3 })
+        .filter((b) => b.otype === "concept" || b.otype === "goal")
+        .map((b) => ({ term: b.object, confidence: b.confidence }));
+    return { likes: terms("likes"), avoids: terms("avoids"), pursues: terms("pursues") };
   }
 
   /** Teach the user's personal meaning of a fuzzy term from one accepted sample
    * (revealed preference): e.g. learn("u","near",3) — they accepted a place 3km
-   * away, so "near" ≥ 3km. Terms: near|walk_time|budget|noise (see calibration). */
+   * away, so "near" ≥ 3km. Terms: near|walk_time|budget|noise|crowd|transit_walk. */
   learn(userId: string, term: string, sample: number, context?: string): void {
     learnCalibration(this.db, userId, term, sample, context);
   }
@@ -372,6 +466,10 @@ export class OpenMap {
   consolidate(userId = DEFAULT_USER): Belief[] {
     return consolidate(this.db, userId);
   }
+  /** Repair inferred contradictions in old DBs, e.g. both likes and avoids loud. */
+  repairContradictions(userId = DEFAULT_USER): RepairAction[] {
+    return repairContradictions(this.db, userId);
+  }
   /** Beliefs with recency decay applied (inferred beliefs fade; stated don't). */
   beliefs(userId = DEFAULT_USER, opts: { predicate?: Predicate; minConfidence?: number } = {}): Belief[] {
     const min = opts.minConfidence ?? 0;
@@ -387,7 +485,11 @@ export class OpenMap {
   setPlaceRole(userId: string, placeId: string, role: "home" | "work"): Belief {
     const belief: Belief = {
       id: null, userId, subject: "user", predicate: role === "home" ? "lives_near" : "works_near",
-      object: placeId, otype: "place", confidence: 0.99, support: ["stated"], source: "stated", updatedAt: nowIso(),
+      object: placeId, otype: "place", confidence: 0.99,
+      support: ["stated"],
+      provenance: [{ kind: "stated", id: placeId, label: role }],
+      source: "stated",
+      updatedAt: nowIso(),
     };
     this.db.upsertBelief(belief);
     return belief;
@@ -405,6 +507,14 @@ export class OpenMap {
 
   relatedPlaces(placeId: string, opts: { limit?: number; radiusKm?: number } = {}): RelatedPlace[] {
     return relatedPlacesOf(this.db, placeId, opts);
+  }
+
+  addPlaceAlias(userId: string, alias: string, placeId: string): PlaceAlias {
+    return this.db.addPlaceAlias(userId, alias, placeId);
+  }
+
+  placeAliases(userId = DEFAULT_USER, placeId?: string): PlaceAlias[] {
+    return placeId ? this.db.aliasesForPlace(userId, placeId) : this.db.listPlaceAliases(userId);
   }
 
   // ---- personal knowledge graph -------------------------------------------
@@ -432,9 +542,9 @@ export class OpenMap {
     this.db.setPersonaPrefs(userId, merged);
     // mirror explicit prefs into stated beliefs so the graph stays unified
     for (const l of merged.likes)
-      this.db.upsertBelief({ id: null, userId, subject: "user", predicate: "likes", object: l, otype: "concept", confidence: 0.95, support: ["stated"], source: "stated", updatedAt: nowIso() });
+      this.db.upsertBelief({ id: null, userId, subject: "user", predicate: "likes", object: l, otype: "concept", confidence: 0.95, support: ["stated"], provenance: [{ kind: "stated", id: null, label: `likes ${l}` }], source: "stated", updatedAt: nowIso() });
     for (const d of merged.dislikes)
-      this.db.upsertBelief({ id: null, userId, subject: "user", predicate: "avoids", object: d, otype: "concept", confidence: 0.95, support: ["stated"], source: "stated", updatedAt: nowIso() });
+      this.db.upsertBelief({ id: null, userId, subject: "user", predicate: "avoids", object: d, otype: "concept", confidence: 0.95, support: ["stated"], provenance: [{ kind: "stated", id: null, label: `avoids ${d}` }], source: "stated", updatedAt: nowIso() });
     return this.getPersona(userId);
   }
 

@@ -17,8 +17,10 @@ export type {
   ObserveResult,
   CaptureResult,
   RecallContext,
+  RecallSource,
 } from "./openmap.js";
 export { formatPersonaContext, formatRecallBlock } from "./memory/hooks.js";
+export type { RecallBlockSource, RecallBlockSources } from "./memory/hooks.js";
 
 export { loadConfig, resolvedEmbedder, resolvedTagger } from "./core/config.js";
 export type { Config } from "./core/config.js";
@@ -49,8 +51,8 @@ export type { MemoryExtractor, ExtractedPlace } from "./nlp/memory-extractor.js"
 export { OpenAILLMRunner, getRunner, extractJson } from "./nlp/llm.js";
 export type { LLMRunner } from "./nlp/llm.js";
 
-export { inferConcept, consolidate, ask, reconcileDecision, decayConfidence } from "./memory/inference.js";
-export type { Inference, ReconcileAction, ReconcileDecision } from "./memory/inference.js";
+export { inferConcept, consolidate, ask, reconcileDecision, repairContradictions, decayConfidence } from "./memory/inference.js";
+export type { Inference, ReconcileAction, ReconcileDecision, RepairAction } from "./memory/inference.js";
 export { tasteVector, effectiveTaste } from "./memory/taste.js";
 export { computeAnchors, defaultAnchor } from "./memory/anchors.js";
 export { frequentedAreas, primaryArea } from "./memory/regions.js";
@@ -58,11 +60,15 @@ export type { Area } from "./memory/regions.js";
 export { TERMS, getCalibration, learnCalibration, allCalibrations, nearRadiusKm } from "./memory/calibration.js";
 export type { Calibration, Agg, TermSpec } from "./memory/calibration.js";
 export { buildGraph, graphToMermaid } from "./memory/graph.js";
+export { canonicalConcepts, createScenarioFromObservation, deriveRoutines } from "./memory/scenarios.js";
 export { personaPositiveText, dislikePenalty } from "./memory/persona.js";
 
 export { derivePlaceVibe } from "./world/affordance.js";
 export { relatedPlaces } from "./world/relations.js";
 export { rankMemory } from "./search/ranking.js";
+export type { RankingBeliefSignals, WeightedBeliefTerm } from "./search/ranking.js";
+export { recallPlaces } from "./search/recall.js";
+export type { RecallPipelineArgs, RecallPipelineResult } from "./search/recall.js";
 
 export { haversineKm, geoBonus, geoGate, geoAffinity } from "./core/geo.js";
 
@@ -85,10 +91,15 @@ export type {
   Relationship,
   Predicate,
   Place,
+  PlaceAlias,
   RawPlace,
   Memory,
+  Scenario,
+  Routine,
   OmEvent,
   Belief,
+  ProvenanceRef,
+  ProvenanceKind,
   ScoredPlace,
   GeoPoint,
   Persona,

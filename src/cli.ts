@@ -103,7 +103,7 @@ program
   .option("-l, --limit <n>", "max recalled places", "5")
   .action(async (query: string, o) => {
     const ctx = await buildOpenMap().recallContext(query, { near: parseNear(o.near), limit: Number(o.limit), userId: user() });
-    emit({ query, system: ctx.system, prepend: ctx.prepend, places: scored(ctx.places) });
+    emit({ query, system: ctx.system, prepend: ctx.prepend, places: scored(ctx.places), sources: ctx.sources });
   });
 
 program
@@ -111,6 +111,34 @@ program
   .description("Search the raw L0 conversation log (BM25) — recall original wording to ground a memory.")
   .option("-l, --limit <n>", "max turns", "10")
   .action((query: string, o) => emit({ query, turns: buildOpenMap().searchConversation(query, { userId: user(), limit: Number(o.limit) }) }));
+
+program
+  .command("scenarios")
+  .description("List L2 scenario summaries grouped from captured turns, places, concepts, and intents")
+  .option("-l, --limit <n>", "max scenarios", "20")
+  .option("--place <placeId>", "filter by place id")
+  .option("--intent <intent>", "filter by intent/goal")
+  .action((o) => emit({ scenarios: buildOpenMap().scenarios(user(), { limit: Number(o.limit), placeId: o.place, intent: o.intent }) }));
+
+program
+  .command("routines")
+  .description("List long-horizon routines derived from repeated scenarios")
+  .option("-l, --limit <n>", "max routines", "20")
+  .option("--scenario-limit <n>", "max recent scenarios to roll up", "200")
+  .option("--min-scenarios <n>", "minimum scenarios per routine", "2")
+  .option("--intent <intent>", "filter by intent/goal")
+  .option("--concept <concept>", "filter by concept")
+  .action((o) =>
+    emit({
+      routines: buildOpenMap().routines(user(), {
+        limit: Number(o.limit),
+        scenarioLimit: Number(o.scenarioLimit),
+        minScenarios: Number(o.minScenarios),
+        intent: o.intent,
+        concept: o.concept,
+      }),
+    }),
+  );
 
 // ---- inference -------------------------------------------------------------
 program
@@ -128,6 +156,11 @@ program
   .command("consolidate")
   .description("Promote behavior (events) into persisted beliefs (L0/L1 → L2)")
   .action(() => emit({ written: buildOpenMap().consolidate(user()) }));
+
+program
+  .command("repair-contradictions")
+  .description("Repair old inferred graph contradictions, e.g. both likes and avoids the same concept")
+  .action(() => emit({ repaired: buildOpenMap().repairContradictions(user()) }));
 
 program
   .command("beliefs")
@@ -175,7 +208,7 @@ program
 
 program
   .command("calibrate <term> <value>")
-  .description("Teach what a fuzzy term means to this user. term: near|walk_time|budget|noise")
+  .description("Teach what a fuzzy term means to this user. term: near|walk_time|budget|noise|crowd|transit_walk")
   .option("--context <c>", "scope to a context, e.g. a goal like 'date' (near-for-a-date ≠ near-for-coffee)")
   .action((term: string, value: string, o) => {
     const om = buildOpenMap();
@@ -185,7 +218,7 @@ program
 
 program
   .command("calibrations")
-  .description("Show the user's learned meaning of fuzzy terms (near/walk_time/budget/noise)")
+  .description("Show the user's learned meaning of fuzzy terms (near/walk_time/budget/noise/crowd/transit_walk)")
   .action(() => emit({ calibrations: buildOpenMap().calibrations(user()) }));
 
 program
@@ -220,7 +253,7 @@ memory
   .command("list").option("-r, --relationship <rel>").option("-l, --limit <n>", "max", "50")
   .action((o) => {
     const items = buildOpenMap().listMemories(user(), { relationship: o.relationship ? relationshipSchema.parse(o.relationship) : undefined, limit: Number(o.limit) });
-    emit({ count: items.length, memories: items.map((it) => ({ id: it.memory.id, relationship: it.memory.relationship, affect: it.memory.affect, note: it.memory.note, place: it.place ? placeBrief(it.place) : null })) });
+    emit({ count: items.length, memories: items.map((it) => ({ id: it.memory.id, relationship: it.memory.relationship, affect: it.memory.affect, note: it.memory.note, sourceRefs: it.memory.sourceRefs ?? [], place: it.place ? placeBrief(it.place) : null })) });
   });
 memory
   .command("forget").option("--id <memoryId>").option("--place <placeId>")
@@ -239,6 +272,10 @@ places.command("related <placeId>").description("Place↔place relations (near +
   .action((placeId: string, o) => emit({ related: buildOpenMap().relatedPlaces(placeId, { limit: Number(o.limit) }) }));
 places.command("home <placeId>").description("Mark a place as the user's home (lives_near)").action((placeId: string) => emit(buildOpenMap().setPlaceRole(user(), placeId, "home")));
 places.command("work <placeId>").description("Mark a place as the user's work (works_near)").action((placeId: string) => emit(buildOpenMap().setPlaceRole(user(), placeId, "work")));
+places.command("alias <alias> <placeId>").description("Add a per-user alias that resolves future mentions to an existing canonical place")
+  .action((alias: string, placeId: string) => emit({ alias: buildOpenMap().addPlaceAlias(user(), alias, placeId) }));
+places.command("aliases [placeId]").description("List per-user place aliases, optionally for one canonical place")
+  .action((placeId?: string) => emit({ aliases: buildOpenMap().placeAliases(user(), placeId) }));
 
 const collection = program.command("collection").description("Named place lists / saved searches");
 collection.command("list").action(() => emit({ collections: buildOpenMap().collectionList(user()) }));

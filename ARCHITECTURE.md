@@ -20,9 +20,9 @@ proximity. Two things make it map-aware and personal:
 ```
 ┌ interface ── cli.ts · mcp.ts  (JSON-first, agent-consumable)
 ├ facade ───── openmap.ts  (OpenMap: orchestrates; logic lives below)
-├ search ───── ranking.ts  (rankMemory: intent×taste×vibe×geo, dislike penalty)
+├ search ───── recall.ts · ranking.ts  (hybrid recall pipeline + rankMemory)
 ├ memory ───── inference (beliefs + reconcile ADD/UPDATE/NOOP + recency decay)
-│              taste · persona · anchors · regions · calibration · graph
+│              taste · persona · anchors · regions · calibration · graph · scenarios
 ├ nlp ──────── embedding · extract (mentions/concepts/intent/measures) · tagger (IntentFrame)
 ├ world ────── affordance (vibe) · relations (near/similar via vector KNN)
 ├ store ────── db.ts  (SQLite + sqlite-vec)
@@ -47,12 +47,14 @@ proximity. Two things make it map-aware and personal:
 ## Data model
 
 ```
-places(id, name, lat, lng, category, address, source, tags[], embedding, …)   -- shared nodes
-memories(id, user_id, place_id, relationship, affect, note, …)                 -- per-user edges
-events(id, user_id, kind, text, place_id, concepts[], intents[], created_at)   -- L0 episodic
-beliefs(user_id, subject, predicate, object, confidence, support, source, …)   -- L2 semantic graph
-calibrations(user_id, term, value, samples)                                    -- learned fuzzy semantics
-personas / collections / collection_items
+places(id, name, lat, lng, category, address, source, tags[], embedding, …)    -- shared nodes
+memories(id, user_id, place_id, relationship, affect, source_refs, …)           -- per-user edges + provenance
+events(id, user_id, kind, text, place_id, concepts[], intents[], created_at)    -- L0 episodic
+beliefs(user_id, subject, predicate, object, confidence, provenance, source, …) -- L2 semantic graph
+calibrations(user_id, term, value, samples)                                     -- learned fuzzy semantics
+place_aliases(user_id, alias, normalized, place_id)                             -- per-user canonicalization
+schema_migrations(version, applied_at)                                          -- durable local upgrades
+personas / collections / collection_items / scenarios
 ```
 
 `places` are objective nodes; everything else is per-user. Taste is *derived*
@@ -63,13 +65,15 @@ the relationship layer; calibrations are the spatial/preference self-model.
 
 ```
 score = ( W_QUERY·sim(frame, place) + W_AFFECT·affect + W_TASTE·sim(taste, place)
-          + W_GEO·geoAffinity(place, learned_near_radius) ) · dislikePenalty · vibeBonus
+          + W_GEO·geoAffinity(place, learned_near_radius) )
+        · dislikePenalty · vibeBonus · symbolicBeliefBonus · constraintBonus
 ```
 
 `geoAffinity` uses the user's **learned** near-radius (no hardcoded distance).
 `recall` resolves the frame (vibe + goals + concepts), defaults an unanchored query
 to the user's anchor (home → most-active area), and logs the query as a behavioral
-event — so searching is itself learning.
+event — so searching is itself learning. Derived symbolic beliefs (`likes`,
+`avoids`, `pursues`) now directly affect ranking, not only the exported graph.
 
 ## Two geo layers, linked
 

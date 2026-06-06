@@ -1,5 +1,5 @@
 import { type RememberedRow } from "../store/db.js";
-import { type GeoPoint, type IntentFrame, type PersonaPrefs, type ScoredPlace } from "../core/types.js";
+import { type GeoPoint, type IntentFrame, type PersonaPrefs, type Place, type ScoredPlace, placeTextBlob } from "../core/types.js";
 import { geoAffinity } from "../core/geo.js";
 import { dislikePenalty } from "../memory/persona.js";
 import { derivePlaceVibe } from "../world/affordance.js";
@@ -32,12 +32,14 @@ export function rankMemory(args: {
   relevance: Map<string, number>; // RRF scores by place id
   tasteSim: number[]; // taste-prior cosine per item (0 when unavailable)
   prefs: PersonaPrefs;
+  beliefSignals?: RankingBeliefSignals;
   frame: IntentFrame;
   near: GeoPoint | null;
   nearRadiusKm: number;
+  constraintLimits?: ConstraintLimits;
   limit: number;
 }): ScoredPlace[] {
-  const { items, relevance, tasteSim, prefs, frame, near, nearRadiusKm, limit } = args;
+  const { items, relevance, tasteSim, prefs, beliefSignals, frame, near, nearRadiusKm, constraintLimits, limit } = args;
   if (items.length === 0) return [];
   const maxRel = Math.max(1e-9, ...[...relevance.values()]);
   const vibeSet = new Set(frame.vibe);
@@ -49,19 +51,158 @@ export function rankMemory(args: {
     const placeVibe = derivePlaceVibe(it.place);
     const vibeHits = placeVibe.filter((v) => vibeSet.has(v)).length;
     const vibeBonus = 1 + Math.min(vibeHits, 3) * 0.15;
+    const concepts = conceptAffinity(it.place, frame);
+    const conceptBonus = 1 + Math.min(concepts.labels.length, 3) * 0.12;
+    const goals = goalAffinity(it.place, frame);
+    const goalBonus = 1 + goals.weight;
+    const constraints = constraintAffinity(it.place, frame, dist, constraintLimits);
+    const constraintBonus = 1 + constraints.hits * 0.18 - constraints.misses * 0.08;
+    const symbolic = symbolicAffinity(it.place, frame, beliefSignals);
     const base = W_REL * rel + W_AFFECT * it.aggAffect + W_TASTE * (tasteSim[i] ?? 0) + W_GEO * geo;
     return {
       place: it.place,
-      score: round(base * penalty * vibeBonus, 4),
+      score: round(base * penalty * vibeBonus * conceptBonus * goalBonus * constraintBonus * symbolic.bonus, 4),
       distanceKm: dist == null ? null : round(dist),
       relationship: it.relationship,
       reasons: {
         relevance: round(rel), affect: round(it.aggAffect), tasteSim: round(tasteSim[i] ?? 0),
-        geoAffinity: round(geo), vibeBonus: round(vibeBonus), dislikePenalty: round(penalty),
+        geoAffinity: round(geo), vibeBonus: round(vibeBonus), conceptBonus: round(conceptBonus), goalBonus: round(goalBonus), constraintBonus: round(constraintBonus), symbolicBonus: round(symbolic.bonus), dislikePenalty: round(penalty),
+        conceptHits: concepts.labels.join(",") || "none",
+        goalHits: goals.labels.join(",") || "none",
+        constraintHits: constraints.hitLabels.join(",") || "none", constraintMisses: constraints.missLabels.join(",") || "none",
+        symbolicLikes: symbolic.likes.join(",") || "none",
+        symbolicAvoids: symbolic.avoids.join(",") || "none",
+        symbolicPursues: symbolic.pursues.join(",") || "none",
         placeVibe: placeVibe.join(",") || "none", goals: frame.goals.join(",") || "none",
       },
     };
   });
   scored.sort((a, b) => b.score - a.score);
   return scored.slice(0, limit);
+}
+
+export interface ConstraintLimits {
+  noiseMax?: number | null;
+  crowdMax?: number | null;
+  transitWalkMax?: number | null;
+  walkTimeMax?: number | null;
+}
+
+export interface WeightedBeliefTerm {
+  term: string;
+  confidence: number;
+}
+
+export interface RankingBeliefSignals {
+  likes: WeightedBeliefTerm[];
+  avoids: WeightedBeliefTerm[];
+  pursues: WeightedBeliefTerm[];
+}
+
+function conceptAffinity(place: Place, frame: IntentFrame): { labels: string[] } {
+  const tokens = new Set(placeTextBlob(place).toLowerCase().match(/[a-z0-9_]+/g) ?? []);
+  const labels: string[] = [];
+  for (const concept of new Set(frame.concepts.map((c) => c.toLowerCase().trim()).filter(Boolean))) {
+    if (tokens.has(concept)) labels.push(concept);
+  }
+  return { labels };
+}
+
+const GOAL_WEIGHTS: Record<string, number> = {
+  work: 0.16,
+  business: 0.14,
+  date: 0.14,
+  romance: 0.12,
+  family: 0.12,
+  celebration: 0.12,
+  study: 0.07,
+  solo: 0.04,
+  hangout: 0.04,
+  explore: 0.03,
+};
+
+function goalAffinity(place: Place, frame: IntentFrame): { weight: number; labels: string[] } {
+  const tags = new Set(place.tags.map((t) => t.toLowerCase().trim()).filter(Boolean));
+  const labels: string[] = [];
+  let weight = 0;
+  for (const goal of new Set(frame.goals.map((g) => g.toLowerCase().trim()).filter(Boolean))) {
+    if (!tags.has(goal)) continue;
+    labels.push(goal);
+    weight += GOAL_WEIGHTS[goal] ?? 0.05;
+  }
+  return { weight: Math.min(weight, 0.35), labels };
+}
+
+function symbolicAffinity(
+  place: Place,
+  frame: IntentFrame,
+  signals: RankingBeliefSignals | undefined,
+): { bonus: number; likes: string[]; avoids: string[]; pursues: string[] } {
+  if (!signals) return { bonus: 1, likes: [], avoids: [], pursues: [] };
+  const blob = placeTextBlob(place).toLowerCase();
+  const tags = new Set(place.tags.map((t) => t.toLowerCase().trim()).filter(Boolean));
+  const frameGoals = new Set(frame.goals.map((g) => g.toLowerCase().trim()).filter(Boolean));
+  const placeMatches = (term: string) => {
+    const t = term.toLowerCase().trim();
+    return !!t && (tags.has(t) || blob.includes(t));
+  };
+  const likes = signals.likes.filter((s) => placeMatches(s.term));
+  const avoids = signals.avoids.filter((s) => placeMatches(s.term));
+  const pursues = signals.pursues.filter((s) => placeMatches(s.term) || (frameGoals.has(s.term.toLowerCase().trim()) && placeMatches(s.term)));
+  const plus = likes.reduce((n, s) => n + Math.min(1, s.confidence) * 0.12, 0) + pursues.reduce((n, s) => n + Math.min(1, s.confidence) * 0.08, 0);
+  const minus = avoids.reduce((n, s) => n + Math.min(1, s.confidence) * 0.45, 0);
+  return {
+    bonus: Math.max(0.25, Math.min(1.4, 1 + plus - minus)),
+    likes: likes.map((s) => s.term),
+    avoids: avoids.map((s) => s.term),
+    pursues: pursues.map((s) => s.term),
+  };
+}
+
+function constraintAffinity(place: Place, frame: IntentFrame, distanceKm: number | null, limits: ConstraintLimits = {}): { hits: number; misses: number; hitLabels: string[]; missLabels: string[] } {
+  const blob = placeTextBlob(place).toLowerCase();
+  const has = (terms: string[]) => terms.some((t) => blob.includes(t));
+  const rawNoise = rawNumber(place, ["noise", "noiseLevel", "noise_level", "noiseScore", "noise_score"]);
+  const rawNoiseDb = rawNumber(place, ["noiseDb", "noise_db", "db"]);
+  const noise = rawNoise ?? (rawNoiseDb == null ? null : Math.max(0, Math.min(1, (rawNoiseDb - 35) / 50)));
+  const crowd = rawNumber(place, ["crowd", "crowdLevel", "crowd_level", "crowdScore", "crowd_score", "busyness"]);
+  const transitWalk = rawNumber(place, ["transitWalkMin", "transit_walk_min", "stationWalkMin", "station_walk_min", "metroWalkMin", "metro_walk_min"]);
+  const walkTime = rawNumber(place, ["walkTimeMin", "walk_time_min", "walkMin", "walk_min"]);
+  const quiet = noise != null ? noise <= (limits.noiseMax ?? 0.35) : has(["quiet", "calm", "peaceful", "low_noise", "low noise"]);
+  const loud = noise != null ? noise > (limits.noiseMax ?? 0.35) : has(["loud", "noisy", "noise", "loud_music", "loud music"]);
+  const lowCrowd = crowd != null ? crowd <= (limits.crowdMax ?? 0.35) : has(["low_crowd", "uncrowded", "not crowded", "not busy", "no line", "no queue"]);
+  const highCrowd = crowd != null ? crowd > (limits.crowdMax ?? 0.35) : has(["crowded", "busy", "packed", "crowd", "line", "queue"]);
+  const transitOk = transitWalk != null ? transitWalk <= (limits.transitWalkMax ?? 8) : has(["transit", "station", "subway", "metro", "train", "bus"]);
+  const walkableOk = walkTime != null ? walkTime <= (limits.walkTimeMax ?? 10) : has(["walkable", "walking distance", "on foot"]) || (distanceKm != null && distanceKm <= 1.5);
+  const hitLabels: string[] = [];
+  const missLabels: string[] = [];
+  const check = (active: boolean, label: string, ok: boolean) => {
+    if (!active) return;
+    (ok ? hitLabels : missLabels).push(label);
+  };
+
+  check(frame.constraints.openNow === true, "open", has(["open_late", "late night", "late-night", "open late", "24/7"]));
+  check(frame.constraints.walkable === true, "walkable", walkableOk);
+  check(frame.constraints.noise === "quiet", "noise:quiet", quiet && !loud);
+  check(frame.constraints.noise === "loud", "noise:loud", loud);
+  check(frame.constraints.crowd === "low", "crowd:low", lowCrowd || (quiet && !highCrowd));
+  check(frame.constraints.crowd === "high", "crowd:high", highCrowd);
+  check(frame.constraints.travelMode === "transit", "transit", transitOk);
+  check(frame.constraints.travelMode === "drive", "drive", has(["parking", "valet", "drive", "driving", "car access"]));
+  for (const d of frame.constraints.dietary ?? []) {
+    const term = d.toLowerCase();
+    check(Boolean(term), term, has([term, "vegetarian", "vegan", "plant-based"]));
+  }
+  check(frame.constraints.maxBudget === "low", "cheap", has(["cheap", "budget", "affordable"]));
+  check(frame.constraints.maxBudget === "high", "fancy", has(["fancy", "upscale", "fine dining", "michelin"]));
+  return { hits: hitLabels.length, misses: missLabels.length, hitLabels, missLabels };
+}
+
+function rawNumber(place: Place, keys: string[]): number | null {
+  for (const key of keys) {
+    const v = place.raw[key];
+    if (typeof v === "number" && Number.isFinite(v)) return v;
+    if (typeof v === "string" && v.trim() && Number.isFinite(Number(v))) return Number(v);
+  }
+  return null;
 }

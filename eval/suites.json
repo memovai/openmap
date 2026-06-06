@@ -1,0 +1,26 @@
+{
+  "name": "openmap-replay-baseline",
+  "description": "Aggregate replay coverage for personal map-assistant memory behavior across local and field-style transcripts.",
+  "suites": [
+    {
+      "id": "mini",
+      "dataset": "dataset.json",
+      "description": "Core LoCoMo-style map memory probes for traceability, recall, contradiction repair, scenarios, routines, and graph output.",
+      "source": "synthetic",
+      "citySlices": ["synthetic"],
+      "languageSlices": ["en"],
+      "styleSlices": ["single-user", "map-assistant", "preference-dense"],
+      "tags": ["core", "l0-l3", "citation", "routine"]
+    },
+    {
+      "id": "field",
+      "dataset": "field-dataset.json",
+      "description": "Broader field-style assistant transcripts spanning travel, date, family, business, study, ambient, transit, and multilingual cases.",
+      "source": "synthetic",
+      "citySlices": ["London", "Paris", "New York", "Shanghai", "Madrid"],
+      "languageSlices": ["en", "zh"],
+      "styleSlices": ["travel", "date", "family", "business", "study", "multilingual"],
+      "tags": ["field", "calibration", "routine", "conversation-grounding"]
+    }
+  ]
+}

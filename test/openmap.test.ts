@@ -1,18 +1,24 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtemp, rm } from "node:fs/promises";
+import { join } from "node:path";
+import { tmpdir } from "node:os";
+import { DatabaseSync } from "node:sqlite";
 
-import { DB } from "../src/store/db.js";
+import { DB, type RememberedRow } from "../src/store/db.js";
 import { type Embedder } from "../src/nlp/embedding.js";
-import { HeuristicExtractor, type ScoredIntent } from "../src/nlp/extract.js";
-import { type Tagger, lexiconFrame } from "../src/nlp/tagger.js";
+import { HeuristicExtractor, extractMeasures, type ScoredIntent } from "../src/nlp/extract.js";
+import { LexiconTagger, type Tagger, lexiconFrame } from "../src/nlp/tagger.js";
 import { OpenMap, buildOpenMap } from "../src/openmap.js";
 import { loadConfig } from "../src/core/config.js";
 import { type LLMRunner } from "../src/nlp/llm.js";
 import { LLMTagger } from "../src/nlp/tagger.js";
 import { decayConfidence, reconcileDecision } from "../src/memory/inference.js";
 import { getCalibration } from "../src/memory/calibration.js";
-import { type ExtractedPlace, type MemoryExtractor } from "../src/nlp/memory-extractor.js";
-import { type Memory, type RawPlace } from "../src/core/types.js";
+import { createScenarioFromObservation } from "../src/memory/scenarios.js";
+import { type ExtractedPlace, LLMMemoryExtractor, type MemoryExtractor } from "../src/nlp/memory-extractor.js";
+import { emptyPrefs, rawToPlace, type IntentFrame, type Memory, type Place, type RawPlace } from "../src/core/types.js";
+import { rankMemory } from "../src/search/ranking.js";
 
 /** Deterministic stand-in for the LLM tagger (tests stay offline). */
 class FakeTagger implements Tagger {
@@ -75,8 +81,8 @@ class FakeEmbedder implements Embedder {
 function makeMemory(): OpenMap {
   return new OpenMap(new DB(":memory:"), new FakeEmbedder(), new HeuristicExtractor(), new FakeTagger());
 }
-const raw = (name: string, lat: number, lng: number, tags: string[]): RawPlace => ({
-  name, lat, lng, category: null, address: null, source: "agent", sourceId: name, tags, raw: {},
+const raw = (name: string, lat: number, lng: number, tags: string[], attrs: Record<string, unknown> = {}): RawPlace => ({
+  name, lat, lng, category: null, address: null, source: "agent", sourceId: name, tags, raw: attrs,
 });
 
 // ---- write + recall --------------------------------------------------------
@@ -106,6 +112,100 @@ test("recall boosts places whose vibe affordances match the resolved intent", as
   const res = await mem.recall("a cozy outdoor spot", null, 5);
   assert.ok((res.find((r) => r.place.name === "Quiet Garden Bistro")!.reasons.vibeBonus as number) > 1);
   assert.equal(res.find((r) => r.place.name === "Loud Sports Bar")!.reasons.vibeBonus, 1);
+});
+
+test("ranker boosts specific goal fit over generic quiet fit", () => {
+  const place = (name: string, tags: string[]): Place => ({
+    id: name,
+    name,
+    lat: null,
+    lng: null,
+    category: null,
+    address: null,
+    source: "test",
+    sourceId: name,
+    tags,
+    raw: {},
+  });
+  const items: RememberedRow[] = [
+    { place: place("Quiet Beans", ["quiet", "solo", "study"]), embedding: null, aggAffect: 1, relationship: "loved" },
+    { place: place("Botanica", ["quiet", "work", "solo", "study"]), embedding: null, aggAffect: 1, relationship: "loved" },
+  ];
+  const frame: IntentFrame = {
+    rawQuery: "a quiet place for solo work calls",
+    goals: ["solo", "work", "study"],
+    companions: "alone",
+    occasion: null,
+    concepts: ["quiet"],
+    vibe: ["quiet"],
+    constraints: {},
+  };
+  const res = rankMemory({
+    items,
+    relevance: new Map(items.map((it) => [it.place.id, 1])),
+    tasteSim: [0, 0],
+    prefs: emptyPrefs(),
+    frame,
+    near: null,
+    nearRadiusKm: 3,
+    limit: 2,
+  });
+  assert.equal(res[0]!.place.name, "Botanica");
+  assert.match(String(res[0]!.reasons.goalHits), /work/);
+  assert.ok((res[0]!.reasons.goalBonus as number) > (res[1]!.reasons.goalBonus as number));
+});
+
+test("recall applies map constraints: open late + dietary + walkable", async () => {
+  const mem = new OpenMap(new DB(":memory:"), new FakeEmbedder(), new HeuristicExtractor(), new LexiconTagger());
+  await mem.rememberPlace(raw("Moon Bowl", 35.61, 139.71, ["vegetarian", "open_late", "walkable"]), { userId: "u", relationship: "liked" });
+  await mem.rememberPlace(raw("Burger Barn", 35.62, 139.72, ["burger"]), { userId: "u", relationship: "liked" });
+  const res = await mem.recall("open late vegan walkable dinner", null, 5, "u");
+  assert.equal(res[0]!.place.name, "Moon Bowl");
+  assert.ok((res[0]!.reasons.constraintBonus as number) > 1);
+  assert.match(String(res[0]!.reasons.constraintHits), /open/);
+  assert.match(String(res[0]!.reasons.constraintHits), /vegetarian/);
+  assert.match(String(res[0]!.reasons.constraintHits), /walkable/);
+});
+
+test("recall applies noise, crowd, and transit constraints", async () => {
+  const mem = new OpenMap(new DB(":memory:"), new FakeEmbedder(), new HeuristicExtractor(), new LexiconTagger());
+  await mem.rememberPlace(raw("Library Nook", 35.61, 139.71, ["quiet", "low_crowd", "transit", "station"]), { userId: "u", relationship: "liked" });
+  await mem.rememberPlace(raw("Roar House", 35.62, 139.72, ["loud", "crowded", "parking"]), { userId: "u", relationship: "liked" });
+  const frame = await mem.resolveIntent("quiet uncrowded place near the subway");
+  assert.equal(frame.constraints.noise, "quiet");
+  assert.equal(frame.constraints.crowd, "low");
+  assert.equal(frame.constraints.travelMode, "transit");
+  const res = await mem.recall("quiet uncrowded place near the subway", null, 5, "u");
+  assert.equal(res[0]!.place.name, "Library Nook");
+  assert.match(String(res[0]!.reasons.constraintHits), /noise:quiet/);
+  assert.match(String(res[0]!.reasons.constraintHits), /crowd:low/);
+  assert.match(String(res[0]!.reasons.constraintHits), /transit/);
+  assert.match(String(res.find((r) => r.place.name === "Roar House")!.reasons.constraintMisses), /noise:quiet/);
+});
+
+test("derived symbolic beliefs directly steer recall ranking", async () => {
+  const mem = new OpenMap(new DB(":memory:"), new FakeEmbedder(), new HeuristicExtractor(), new LexiconTagger());
+  await mem.rememberPlace(raw("Quiet Study Room", 35.61, 139.71, ["study", "quiet"]), { userId: "u", relationship: "mentioned" });
+  await mem.rememberPlace(raw("Loud Study Bar", 35.62, 139.72, ["study", "loud"]), { userId: "u", relationship: "mentioned" });
+  mem.db.upsertBelief({
+    id: null,
+    userId: "u",
+    subject: "user",
+    predicate: "avoids",
+    object: "loud",
+    otype: "concept",
+    confidence: 0.9,
+    support: ["negative place"],
+    provenance: [{ kind: "place", id: "p", label: "negative place" }],
+    source: "inferred",
+    updatedAt: new Date().toISOString(),
+  });
+
+  const res = await mem.recall("study spot", null, 2, "u");
+  assert.equal(res[0]!.place.name, "Quiet Study Room");
+  const loud = res.find((r) => r.place.name === "Loud Study Bar")!;
+  assert.match(String(loud.reasons.symbolicAvoids), /loud/);
+  assert.ok((loud.reasons.symbolicBonus as number) < 1);
 });
 
 test("recall on empty memory is safe", async () => {
@@ -217,6 +317,24 @@ test("auto-capture logs raw turns to L0 and conversation_search recalls them", a
   assert.equal(mem.searchConversation("work done", { userId: "other" }).length, 0);
 });
 
+test("capture and consolidation preserve structured provenance", async () => {
+  const mem = makeMemory();
+  await mem.capture(
+    [
+      { role: "assistant", content: '"Botanica" is quiet.' },
+      { role: "user", content: 'I loved "Botanica" for quiet work.' },
+    ],
+    { userId: "u" },
+  );
+  const stored = mem.listMemories("u")[0]!.memory;
+  assert.ok(stored.sourceRefs?.some((r) => r.kind === "turn" && /Botanica/.test(r.snippet ?? "")));
+
+  mem.consolidate("u");
+  const belief = mem.beliefs("u", { predicate: "likes" }).find((b) => b.object === "quiet")!;
+  assert.ok(belief);
+  assert.ok(belief.provenance?.some((r) => r.kind === "event" || r.kind === "place"));
+});
+
 test("auto-capture with extract:false only logs raw turns (defers extraction)", async () => {
   const mem = makeMemory();
   const res = await mem.capture([{ role: "user", content: 'thinking about "Brew Lab"' }], { userId: "u", extract: false });
@@ -237,6 +355,133 @@ test("auto-recall builds an injectable persona block + relevant-places block", a
   assert.match(ctx.prepend, /recalled-places/);
   assert.match(ctx.prepend, /Quiet Beans/);
   assert.ok(ctx.places.length >= 1);
+});
+
+test("auto-recall cites raw L0 turns for recalled places", async () => {
+  const mem = makeMemory();
+  await mem.capture(
+    [
+      { role: "assistant", content: '"Botanica" in Daikanyama is quiet and 1.2km away.' },
+      { role: "user", content: 'For solo work calls, pick "Botanica" — I loved the quiet tables.' },
+    ],
+    { userId: "u" },
+  );
+  const ctx = await mem.recallContext("somewhere quiet for calls", { userId: "u", limit: 3 });
+  const botanica = ctx.places.find((r) => r.place.name === "Botanica")!;
+  assert.ok(botanica);
+  assert.match(ctx.prepend, /Botanica/);
+  assert.match(ctx.prepend, /source turn#\d+/);
+  assert.ok(ctx.sources[botanica.place.id]?.some((s) => /loved the quiet tables/.test(s.snippet)));
+});
+
+test("capture creates an L2 scenario linking turns, places, concepts, and intents", async () => {
+  const mem = makeMemory();
+  const res = await mem.capture(
+    [
+      { role: "assistant", content: '"Botanica" in Daikanyama is 1.2km away and quiet; "Neon Alley" is loud.' },
+      { role: "user", content: 'For solo work calls, pick "Botanica" — I loved the quiet tables.' },
+      { role: "user", content: 'I tried "Neon Alley" later and disliked it, too noisy for calls.' },
+    ],
+    { userId: "u" },
+  );
+  assert.ok(res.scenario);
+  assert.equal(res.scenario.turnIds.length, 3);
+  assert.ok(res.scenario.intents.includes("work"));
+  assert.ok(res.scenario.concepts.includes("quiet"));
+  const scenarios = mem.scenarios("u", { intent: "work" });
+  assert.equal(scenarios.length, 1);
+  assert.match(scenarios[0]!.summary, /Botanica/);
+  assert.equal(scenarios[0]!.placeIds.length, 2);
+});
+
+test("scenario layer filters non-canonical LLM goals and negative concepts", async () => {
+  const scenarioTagger: Tagger = {
+    async frame(text: string) {
+      return {
+        rawQuery: text,
+        goals: ["solo", "work", "study"],
+        companions: "alone",
+        occasion: null,
+        concepts: ["quiet_tables", "not-touristy"],
+        vibe: [],
+        constraints: {},
+      };
+    },
+    async concepts() { return ["quiet_tables", "not-touristy"]; },
+    async intents() { return [{ purpose: "solo", score: 1 }, { purpose: "work", score: 1 }]; },
+  };
+  const fake: MemoryExtractor = {
+    async extract(): Promise<ExtractedPlace[]> {
+      return [
+        {
+          name: "Botanica",
+          relationship: "loved",
+          companions: [],
+          region: null,
+          measures: [],
+          goal: "solo work calls",
+          concepts: ["quiet_tables", "not-quiet", "not-touristy", "not_burger", "meat-heavy"],
+        },
+      ];
+    },
+  };
+  const mem = new OpenMap(new DB(":memory:"), new FakeEmbedder(), new HeuristicExtractor(), scenarioTagger, 60, fake);
+  await mem.capture([{ role: "user", content: 'For solo work calls, pick "Botanica" — I loved the quiet tables.' }], { userId: "u" });
+  const scenario = mem.scenarios("u")[0]!;
+  assert.match(scenario.title, /^work:/);
+  assert.match(scenario.summary, /preferred Botanica/);
+  assert.ok(scenario.intents.includes("work"));
+  assert.ok(!scenario.intents.includes("solo work calls"));
+  assert.ok(scenario.concepts.includes("quiet"));
+  assert.ok(!scenario.concepts.includes("not-quiet"));
+  assert.ok(!scenario.concepts.includes("quiet_tables"));
+  assert.ok(!scenario.concepts.includes("not-touristy"));
+  assert.ok(!scenario.concepts.includes("not_burger"));
+  assert.ok(!scenario.concepts.includes("meat-heavy"));
+});
+
+test("routines roll repeated focus scenarios into a durable long-horizon pattern", async () => {
+  const mem = makeMemory();
+  await mem.capture(
+    [
+      { role: "assistant", content: '"Botanica" is quiet; "Neon Alley" is loud.' },
+      { role: "user", content: 'For solo work calls, pick "Botanica" — I loved the quiet tables.' },
+      { role: "user", content: 'I tried "Neon Alley" later and disliked it, too noisy for calls.' },
+    ],
+    { userId: "u" },
+  );
+  await mem.capture(
+    [
+      { role: "assistant", content: '"Study Hall" is quiet, uncrowded, and next to a subway station. "Arcade Plaza" is packed and loud.' },
+      { role: "user", content: 'For a study spot by train, pick "Study Hall" — I loved that it was uncrowded and next to the station.' },
+      { role: "user", content: 'I tried "Arcade Plaza" later and disliked it, too crowded and loud for studying.' },
+    ],
+    { userId: "u" },
+  );
+  await mem.capture(
+    [
+      { role: "assistant", content: '"Cowork Library" is quiet, uncrowded, and beside the metro. "Rush Hub" is packed and loud.' },
+      { role: "user", content: 'For a study session, pick "Cowork Library" — I loved that it was quiet, uncrowded, and by the metro.' },
+      { role: "user", content: 'I tried "Rush Hub" later and disliked it, too loud and crowded for studying.' },
+    ],
+    { userId: "u" },
+  );
+
+  const routine = mem.routines("u", { minScenarios: 3 })[0]!;
+  const name = (id: string) => mem.db.getPlace(id)?.name ?? id;
+  assert.match(routine.title, /^focus:/);
+  assert.equal(routine.support, 3);
+  assert.ok(routine.intents.includes("work"));
+  assert.ok(routine.intents.includes("study"));
+  assert.ok(routine.concepts.includes("quiet"));
+  assert.ok(routine.concepts.includes("low_crowd"));
+  assert.ok(routine.concepts.includes("transit"));
+  assert.ok(routine.positivePlaceIds.map(name).includes("Cowork Library"));
+  assert.ok(routine.negativePlaceIds.map(name).includes("Rush Hub"));
+  assert.match(routine.summary, /near transit/);
+  assert.match(routine.summary, /preferred/);
+  assert.match(routine.summary, /avoided/);
+  assert.ok(routine.confidence >= 0.8);
 });
 
 test("auto-recall persona/prepend blocks are empty when nothing is known", async () => {
@@ -269,6 +514,41 @@ test("personal knowledge graph + Mermaid expose user→concept edges", async () 
   assert.match(mmd, /coffee/);
 });
 
+test("repair contradictions removes weaker inferred likes/avoids conflicts", () => {
+  const mem = makeMemory();
+  mem.db.upsertBelief({
+    id: null,
+    userId: "u",
+    subject: "user",
+    predicate: "likes",
+    object: "loud",
+    otype: "concept",
+    confidence: 0.35,
+    support: ["old inference"],
+    source: "inferred",
+    updatedAt: new Date().toISOString(),
+  });
+  mem.db.upsertBelief({
+    id: null,
+    userId: "u",
+    subject: "user",
+    predicate: "avoids",
+    object: "loud",
+    otype: "concept",
+    confidence: 0.7,
+    support: ["negative place"],
+    source: "inferred",
+    updatedAt: new Date().toISOString(),
+  });
+  const repaired = mem.repairContradictions("u");
+  assert.equal(repaired.length, 1);
+  assert.equal(repaired[0]!.object, "loud");
+  assert.equal(repaired[0]!.kept.predicate, "avoids");
+  assert.equal(repaired[0]!.removed.predicate, "likes");
+  assert.equal(mem.beliefs("u", { predicate: "likes" }).some((b) => b.object === "loud"), false);
+  assert.equal(mem.beliefs("u", { predicate: "avoids" }).some((b) => b.object === "loud"), true);
+});
+
 // ---- relations, anchors, persona ------------------------------------------
 test("place roles + default anchor for unanchored queries", async () => {
   const mem = makeMemory();
@@ -293,11 +573,69 @@ test("observe auto-learns calibration from accepted measures (revealed preferenc
   assert.ok(res.learned.some((m) => m.term === "near" && m.value === 3));
 });
 
+test("extractMeasures derives ambient and transit-access calibration samples", () => {
+  const measures = extractMeasures("quiet, uncrowded, 42 dB, 3/10 crowd, and next to the subway station");
+  assert.ok(measures.some((m) => m.term === "noise" && m.value === 0.14));
+  assert.ok(measures.some((m) => m.term === "crowd" && m.value === 0.3));
+  assert.ok(measures.some((m) => m.term === "transit_walk" && m.value === 2));
+});
+
+test("observe learns noise, crowd, and transit friction from accepted scoped context", async () => {
+  const mem = makeMemory();
+  const res = await mem.observe(
+    [
+      { role: "assistant", content: '"Study Hall" is quiet, uncrowded, and next to a subway station. "Arcade Plaza" is packed and loud.' },
+      { role: "user", content: 'For a study spot by train, pick "Study Hall" — I loved that it was uncrowded and next to the station.' },
+      { role: "user", content: 'I tried "Arcade Plaza" later and disliked it, too crowded and loud for studying.' },
+    ],
+    { userId: "u" },
+  );
+  const cal = (term: string) => mem.calibrations("u").find((c) => c.term === term)!;
+  assert.equal(cal("noise").value, 0.2);
+  assert.equal(cal("crowd").value, 0.2);
+  assert.equal(cal("transit_walk").value, 2);
+  assert.ok(mem.calibrations("u").some((c) => c.term === "noise@study" && c.value === 0.2));
+  assert.ok(mem.calibrations("u").some((c) => c.term === "crowd@study" && c.value === 0.2));
+  assert.ok(mem.calibrations("u").some((c) => c.term === "transit_walk@study" && c.value === 2));
+  assert.ok(res.learned.some((m) => m.term === "noise" && m.value === 0.2));
+  assert.ok(!res.learned.some((m) => m.term === "noise" && m.value === 0.85));
+});
+
+test("learned constraint thresholds rank numeric raw place attributes", async () => {
+  const mem = new OpenMap(new DB(":memory:"), new FakeEmbedder(), new HeuristicExtractor(), new LexiconTagger());
+  mem.learn("u", "noise", 0.25, "study");
+  mem.learn("u", "crowd", 0.25, "study");
+  mem.learn("u", "transit_walk", 4, "study");
+  await mem.rememberPlace(raw("Measured Study Nook", 35.61, 139.71, ["study"], { noise: 0.2, crowd: 0.2, transitWalkMin: 3 }), { userId: "u", relationship: "liked" });
+  await mem.rememberPlace(raw("Measured Busy Hub", 35.62, 139.72, ["study"], { noise: 0.6, crowd: 0.7, transitWalkMin: 12 }), { userId: "u", relationship: "liked" });
+  const res = await mem.recall("quiet uncrowded study spot near transit", null, 2, "u");
+  assert.equal(res[0]!.place.name, "Measured Study Nook");
+  assert.match(String(res[0]!.reasons.constraintHits), /noise:quiet/);
+  assert.match(String(res[0]!.reasons.constraintHits), /crowd:low/);
+  assert.match(String(res[0]!.reasons.constraintHits), /transit/);
+  assert.match(String(res[1]!.reasons.constraintMisses), /noise:quiet/);
+  assert.match(String(res[1]!.reasons.constraintMisses), /crowd:low/);
+  assert.match(String(res[1]!.reasons.constraintMisses), /transit/);
+});
+
 test("mention extraction ignores contraction apostrophes", async () => {
   const mem = makeMemory();
   const out = await mem.remember('let\'s do "Ritual Coffee", loved it', { relationship: "loved" });
   assert.equal(out.length, 1);
   assert.equal(mem.listMemories()[0]!.place!.name, "Ritual Coffee"); // not "s do"
+});
+
+test("place aliases canonicalize future mention-only observations", async () => {
+  const mem = makeMemory();
+  const first = await mem.rememberPlace(raw("Botanica", 35.61, 139.71, ["quiet", "work"]), { userId: "u", relationship: "visited" });
+  mem.addPlaceAlias("u", "the plant cafe", first.placeId);
+  const res = await mem.observe([{ role: "user", content: 'I loved "the plant cafe" for quiet work.' }], { userId: "u" });
+  assert.equal(res.actions[0]!.placeId, first.placeId);
+  const memories = mem.listMemories("u");
+  assert.equal(memories.length, 1);
+  assert.equal(memories[0]!.place!.name, "Botanica");
+  assert.equal(memories[0]!.memory.relationship, "loved");
+  assert.ok(mem.placeAliases("u", first.placeId).some((a) => a.normalized === "the plant cafe"));
 });
 
 test("observe learns context-conditioned calibration from the turn's intent", async () => {
@@ -331,6 +669,36 @@ test("structured extraction: per-place sentiment + named region (LLM-shaped)", a
   assert.equal(getCalibration(mem.db, "u", "near", "date").value, 4); // accepted 4km for a date
 });
 
+test("key-free observe scopes sentiment, concepts, measures, and regions per place", async () => {
+  const mem = makeMemory();
+  await mem.observe(
+    [
+      { role: "assistant", content: '"Botanica" in Daikanyama is 1.2km away and quiet; "Neon Alley" in Shinjuku is 0.6km away but loud.' },
+      { role: "user", content: 'For solo work calls, pick "Botanica" — I loved the quiet tables.' },
+      { role: "user", content: 'I tried "Neon Alley" in Shinjuku later and disliked it, too noisy for calls.' },
+    ],
+    { userId: "u" },
+  );
+  mem.consolidate("u");
+  const rels = Object.fromEntries(mem.listMemories("u").map((it) => [it.place!.name, it.memory.relationship]));
+  assert.equal(rels["Botanica"], "loved");
+  assert.equal(rels["Neon Alley"], "disliked");
+  assert.ok(mem.beliefs("u", { predicate: "frequents" }).some((b) => b.object === "Daikanyama"));
+  assert.equal(getCalibration(mem.db, "u", "near", "work").value, 1.2);
+  assert.equal(mem.ask("do I avoid noisy places?", "u").likely, true);
+});
+
+test("negative place experience becomes avoid-persona context", async () => {
+  const mem = makeMemory();
+  await mem.observe([{ role: "user", content: 'I disliked "Loud Sports Bar"; too noisy for calls' }], { userId: "u" });
+  mem.consolidate("u");
+  assert.ok(mem.beliefs("u", { predicate: "avoids" }).some((b) => b.object === "loud"));
+  assert.ok(!mem.beliefs("u", { predicate: "likes" }).some((b) => b.object === "loud"));
+  const ctx = await mem.recallContext("somewhere quiet for calls", { userId: "u" });
+  assert.match(ctx.system, /Avoids:.*loud/);
+  assert.doesNotMatch(ctx.system, /Likes:.*loud/);
+});
+
 test("observe does not learn from a rejection", async () => {
   const mem = makeMemory();
   await mem.observe(
@@ -356,9 +724,82 @@ test("LLM extraction runs through an injectable runner (host model / BYOC)", asy
   const f = await new LLMTagger(runner, "any-model").frame("anything");
   assert.ok(f.goals.includes("date"));
   assert.equal(f.companions, "partner");
+  const withLexicalConstraints = await new LLMTagger(runner, "any-model").frame("quiet uncrowded place near the subway");
+  assert.equal(withLexicalConstraints.constraints.noise, "quiet");
+  assert.equal(withLexicalConstraints.constraints.crowd, "low");
+  assert.equal(withLexicalConstraints.constraints.travelMode, "transit");
   // end-to-end: inject the runner into buildOpenMap (no API key needed)
   const om = buildOpenMap({ ...loadConfig({}), dbPath: ":memory:" }, { llm: runner });
   assert.ok((await om.resolveIntent("anything")).goals.includes("date"));
+});
+
+test("LLM memory extraction merges scoped fallback constraint measures", async () => {
+  const runner: LLMRunner = {
+    async run() {
+      return JSON.stringify({
+        places: [
+          {
+            name: "Study Hall",
+            relationship: "loved",
+            companions: [],
+            region: null,
+            measures: [],
+            goal: "study",
+            concepts: [],
+          },
+        ],
+      });
+    },
+  };
+  const mem = new OpenMap(
+    new DB(":memory:"),
+    null,
+    new HeuristicExtractor(),
+    new LexiconTagger(),
+    60,
+    new LLMMemoryExtractor(runner, "test"),
+  );
+  await mem.observe(
+    [
+      { role: "assistant", content: '"Study Hall" is quiet, uncrowded, and next to a subway station.' },
+      { role: "user", content: 'For a study spot by train, pick "Study Hall" — I loved that it was uncrowded and next to the station.' },
+    ],
+    { userId: "u" },
+  );
+  assert.ok(mem.calibrations("u").some((c) => c.term === "noise@study" && c.value === 0.2));
+  assert.ok(mem.calibrations("u").some((c) => c.term === "crowd@study" && c.value === 0.2));
+  assert.ok(mem.calibrations("u").some((c) => c.term === "transit_walk@study" && c.value === 2));
+});
+
+test("LLM memory extraction ignores zero spatial and budget measures", async () => {
+  const runner: LLMRunner = {
+    async run() {
+      return JSON.stringify({
+        places: [
+          {
+            name: "Study Hall",
+            relationship: "loved",
+            companions: [],
+            region: null,
+            measures: [
+              { term: "near", value: 0 },
+              { term: "walk_time", value: 0 },
+              { term: "budget", value: 0 },
+              { term: "noise", value: 0 },
+              { term: "budget", value: 500 },
+            ],
+            goal: "study",
+            concepts: ["quiet"],
+          },
+        ],
+      });
+    },
+  };
+  const extracted = await new LLMMemoryExtractor(runner, "any-model").extract('pick "Study Hall"');
+  assert.deepEqual(extracted[0]!.measures, [
+    { term: "noise", value: 0 },
+    { term: "budget", value: 500 },
+  ]);
 });
 
 test("calibration layer learns personal meaning of fuzzy terms", () => {
@@ -370,9 +811,16 @@ test("calibration layer learns personal meaning of fuzzy terms", () => {
   assert.equal(mem.anchors("u").nearRadiusKm, 3);
   mem.learn("u", "near", 1); // a closer accept doesn't shrink the tolerance
   assert.equal(cal("u", "near").value, 3);
-  // generic terms: walk_time (max), budget (ema → first sample sets it)
+  // generic terms: walk_time/transit/noise/crowd are thresholds; budget is an EMA.
   mem.learn("u", "walk_time", 12);
   assert.equal(cal("u", "walk_time").value, 12);
+  mem.learn("u", "noise", 0.2);
+  mem.learn("u", "noise", 0.1);
+  assert.equal(cal("u", "noise").value, 0.2);
+  mem.learn("u", "crowd", 0.25);
+  assert.equal(cal("u", "crowd").value, 0.25);
+  mem.learn("u", "transit_walk", 4);
+  assert.equal(cal("u", "transit_walk").value, 4);
   mem.learn("u", "budget", 500);
   assert.equal(cal("u", "budget").value, 500);
   // unknown terms are ignored (no hardcoded behavior)
@@ -459,6 +907,68 @@ test("forget, collections, export/import", async () => {
   assert.equal(mem.listMemories("b").length, 1);
   assert.equal(mem.forget("a", { memoryId: out[0]!.id! }), 1);
   assert.equal(mem.listMemories("a").length, 0);
+});
+
+test("schema migrations upgrade old databases with provenance and aliases", async () => {
+  const dir = await mkdtemp(join(tmpdir(), "openmap-migrate-"));
+  const file = join(dir, "old.db");
+  try {
+    const old = new DatabaseSync(file);
+    old.exec(`
+      CREATE TABLE memories (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL DEFAULT 'default',
+        place_id TEXT NOT NULL, relationship TEXT NOT NULL, affect REAL NOT NULL DEFAULT 0,
+        note TEXT, companions TEXT, occurred_at TEXT, created_at TEXT, source TEXT
+      );
+      CREATE TABLE beliefs (
+        id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
+        subject TEXT NOT NULL, predicate TEXT NOT NULL, object TEXT NOT NULL,
+        otype TEXT NOT NULL, confidence REAL NOT NULL, support TEXT, source TEXT, updated_at TEXT,
+        UNIQUE(user_id, subject, predicate, object)
+      );
+    `);
+    old.close();
+
+    const db = new DB(file);
+    assert.deepEqual(db.migrationVersions(), [1, 2, 3]);
+    db.upsertPlace(rawToPlace(raw("Botanica", 35.61, 139.71, ["quiet"])), null);
+    db.addPlaceAlias("u", "the plant cafe", "agent:Botanica");
+    assert.equal(db.resolvePlaceAlias("u", "THE PLANT CAFE"), "agent:Botanica");
+    db.addMemory({
+      id: null,
+      userId: "u",
+      placeId: "agent:Botanica",
+      relationship: "loved",
+      affect: 1,
+      note: null,
+      companions: [],
+      occurredAt: null,
+      createdAt: new Date().toISOString(),
+      source: "test",
+      sourceRefs: [{ kind: "turn", id: 1, snippet: "loved Botanica" }],
+    });
+    assert.equal(db.listMemories("u")[0]!.memory.sourceRefs?.[0]?.kind, "turn");
+    db.close();
+  } finally {
+    await rm(dir, { recursive: true, force: true });
+  }
+});
+
+test("scenario service creates summaries outside the OpenMap facade", () => {
+  const scenario = createScenarioFromObservation(
+    "u",
+    [{ id: 1, role: "user", content: 'loved "Botanica"', at: "2026-01-01T00:00:00.000Z" }],
+    {
+      userTurns: 1,
+      actions: [{ place: "Botanica", placeId: "p1", action: "add", relationship: "loved", reason: "new place" }],
+      concepts: ["quiet_tables", "not_loud", "coffee"],
+      intents: ["work"],
+    },
+  )!;
+  assert.equal(scenario.title, "work: Botanica");
+  assert.deepEqual(scenario.placeIds, ["p1"]);
+  assert.ok(scenario.concepts.includes("coffee"));
+  assert.ok(!scenario.concepts.includes("not_loud"));
 });
 
 test("sqlite-vec store is enabled and powers KNN", async () => {

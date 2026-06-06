@@ -7,9 +7,12 @@ import {
   type Memory,
   type OmEvent,
   type Place,
+  type PlaceAlias,
   type PersonaPrefs,
   type Predicate,
+  type ProvenanceRef,
   type Relationship,
+  type Scenario,
   nowIso,
   placeTextBlob,
 } from "../core/types.js";
@@ -29,7 +32,7 @@ CREATE TABLE IF NOT EXISTS places (
 CREATE TABLE IF NOT EXISTS memories (
   id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL DEFAULT 'default',
   place_id TEXT NOT NULL, relationship TEXT NOT NULL, affect REAL NOT NULL DEFAULT 0,
-  note TEXT, companions TEXT, occurred_at TEXT, created_at TEXT, source TEXT
+  note TEXT, companions TEXT, occurred_at TEXT, created_at TEXT, source TEXT, source_refs TEXT
 );
 CREATE INDEX IF NOT EXISTS idx_memories_user_place ON memories(user_id, place_id);
 CREATE TABLE IF NOT EXISTS events (
@@ -41,8 +44,11 @@ CREATE INDEX IF NOT EXISTS idx_events_user ON events(user_id);
 CREATE TABLE IF NOT EXISTS beliefs (
   id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
   subject TEXT NOT NULL, predicate TEXT NOT NULL, object TEXT NOT NULL,
-  otype TEXT NOT NULL, confidence REAL NOT NULL, support TEXT, source TEXT, updated_at TEXT,
+  otype TEXT NOT NULL, confidence REAL NOT NULL, support TEXT, provenance TEXT, source TEXT, updated_at TEXT,
   UNIQUE(user_id, subject, predicate, object)
+);
+CREATE TABLE IF NOT EXISTS schema_migrations (
+  version INTEGER PRIMARY KEY, applied_at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS personas (
   user_id TEXT PRIMARY KEY, prefs TEXT NOT NULL, updated_at TEXT
@@ -59,6 +65,15 @@ CREATE TABLE IF NOT EXISTS collection_items (
   collection_id INTEGER NOT NULL, place_id TEXT NOT NULL, added_at TEXT,
   PRIMARY KEY (collection_id, place_id)
 );
+CREATE TABLE IF NOT EXISTS place_aliases (
+  user_id TEXT NOT NULL,
+  alias TEXT NOT NULL,
+  normalized TEXT NOT NULL,
+  place_id TEXT NOT NULL,
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (user_id, normalized)
+);
+CREATE INDEX IF NOT EXISTS idx_place_aliases_place ON place_aliases(user_id, place_id);
 CREATE VIRTUAL TABLE IF NOT EXISTS place_fts USING fts5(place_id UNINDEXED, text);
 CREATE TABLE IF NOT EXISTS turns (
   id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL DEFAULT 'default',
@@ -66,6 +81,13 @@ CREATE TABLE IF NOT EXISTS turns (
 );
 CREATE INDEX IF NOT EXISTS idx_turns_user ON turns(user_id, id);
 CREATE VIRTUAL TABLE IF NOT EXISTS turn_fts USING fts5(turn_id UNINDEXED, user_id UNINDEXED, content);
+CREATE TABLE IF NOT EXISTS scenarios (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, user_id TEXT NOT NULL,
+  title TEXT NOT NULL, summary TEXT NOT NULL,
+  turn_ids TEXT NOT NULL, place_ids TEXT NOT NULL, concepts TEXT NOT NULL, intents TEXT NOT NULL,
+  started_at TEXT, ended_at TEXT, created_at TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_scenarios_user ON scenarios(user_id, id);
 `;
 
 export interface RememberedRow {
@@ -102,9 +124,7 @@ export class DB {
     if (path !== ":memory:") mkdirSync(dirname(path), { recursive: true });
     this.db = new DatabaseSync(path, { allowExtension: true });
     this.db.exec(SCHEMA);
-    const cols = this.db.prepare("PRAGMA table_info(memories)").all() as Array<{ name: string }>;
-    if (!cols.some((c) => c.name === "user_id"))
-      this.db.exec("ALTER TABLE memories ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default'");
+    this.runMigrations();
     this.loadVec();
   }
 
@@ -136,6 +156,54 @@ export class DB {
       `CREATE VIRTUAL TABLE IF NOT EXISTS place_vec USING vec0(place_id TEXT PRIMARY KEY, embedding float[${dim}] distance_metric=cosine)`,
     );
     this.vecDim = dim;
+  }
+
+  private runMigrations(): void {
+    const migrations: Array<{ version: number; apply: () => void }> = [
+      {
+        version: 1,
+        apply: () => {
+          if (!this.hasColumn("memories", "user_id"))
+            this.db.exec("ALTER TABLE memories ADD COLUMN user_id TEXT NOT NULL DEFAULT 'default'");
+        },
+      },
+      {
+        version: 2,
+        apply: () => {
+          if (!this.hasColumn("memories", "source_refs"))
+            this.db.exec("ALTER TABLE memories ADD COLUMN source_refs TEXT");
+          if (!this.hasColumn("beliefs", "provenance"))
+            this.db.exec("ALTER TABLE beliefs ADD COLUMN provenance TEXT");
+        },
+      },
+      {
+        version: 3,
+        apply: () => {
+          this.db.exec(
+            `CREATE TABLE IF NOT EXISTS place_aliases (
+              user_id TEXT NOT NULL,
+              alias TEXT NOT NULL,
+              normalized TEXT NOT NULL,
+              place_id TEXT NOT NULL,
+              created_at TEXT NOT NULL,
+              PRIMARY KEY (user_id, normalized)
+            )`,
+          );
+          this.db.exec("CREATE INDEX IF NOT EXISTS idx_place_aliases_place ON place_aliases(user_id, place_id)");
+        },
+      },
+    ];
+    for (const m of migrations) {
+      const done = this.db.prepare("SELECT 1 FROM schema_migrations WHERE version=?").get(m.version);
+      if (done) continue;
+      m.apply();
+      this.db.prepare("INSERT OR IGNORE INTO schema_migrations (version, applied_at) VALUES (?, ?)").run(m.version, nowIso());
+    }
+  }
+
+  private hasColumn(table: string, column: string): boolean {
+    const cols = this.db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>;
+    return cols.some((c) => c.name === column);
   }
 
   /** k-NN over stored place embeddings. Uses sqlite-vec vec0 when available,
@@ -179,19 +247,27 @@ export class DB {
   /** Append raw turns verbatim, so the original wording can be recalled later
    * for grounding ("when did I say I loved X"). Returns rows inserted. */
   recordTurns(userId: string, turns: Array<{ role: string; content: string; at?: string }>, now: string): number {
+    return this.recordTurnsDetailed(userId, turns, now).length;
+  }
+
+  /** Append raw turns and return the stored L0 turn ids for scenario linking. */
+  recordTurnsDetailed(userId: string, turns: Array<{ role: string; content: string; at?: string }>, now: string): StoredTurn[] {
     const ins = this.db.prepare(
       "INSERT INTO turns (user_id, role, content, occurred_at, created_at) VALUES (?, ?, ?, ?, ?)",
     );
     const fts = this.db.prepare("INSERT INTO turn_fts (turn_id, user_id, content) VALUES (?, ?, ?)");
-    let n = 0;
+    const out: StoredTurn[] = [];
     for (const t of turns) {
       const content = (t.content ?? "").trim();
       if (!content) continue;
-      const r = ins.run(userId, t.role || "user", content, t.at ?? now, now);
-      fts.run(Number(r.lastInsertRowid), userId, content);
-      n++;
+      const role = t.role || "user";
+      const at = t.at ?? now;
+      const r = ins.run(userId, role, content, at, now);
+      const id = Number(r.lastInsertRowid);
+      fts.run(id, userId, content);
+      out.push({ id, role, content, at });
     }
-    return n;
+    return out;
   }
 
   /** BM25 keyword search over raw turns, newest-first on ties. */
@@ -220,6 +296,41 @@ export class DB {
   countTurns(userId: string): number {
     const r = this.db.prepare("SELECT COUNT(*) AS n FROM turns WHERE user_id = ?").get(userId) as { n: number };
     return r.n;
+  }
+
+  migrationVersions(): number[] {
+    return (this.db.prepare("SELECT version FROM schema_migrations ORDER BY version").all() as Array<{ version: number }>).map((r) => r.version);
+  }
+
+  // ---- scenarios (L2 episode summaries) ----------------------------------
+  addScenario(s: Scenario): number {
+    const res = this.db
+      .prepare(
+        `INSERT INTO scenarios (user_id,title,summary,turn_ids,place_ids,concepts,intents,started_at,ended_at,created_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
+      )
+      .run(
+        s.userId, s.title, s.summary,
+        JSON.stringify(s.turnIds), JSON.stringify(s.placeIds), JSON.stringify(s.concepts), JSON.stringify(s.intents),
+        s.startedAt, s.endedAt, s.createdAt,
+      );
+    return Number(res.lastInsertRowid);
+  }
+
+  listScenarios(userId: string, opts: { limit?: number; placeId?: string; intent?: string } = {}): Scenario[] {
+    const params: unknown[] = [userId];
+    let sql = "SELECT * FROM scenarios WHERE user_id=?";
+    if (opts.placeId) {
+      sql += " AND place_ids LIKE ?";
+      params.push(`%"${opts.placeId}"%`);
+    }
+    if (opts.intent) {
+      sql += " AND intents LIKE ?";
+      params.push(`%"${opts.intent}"%`);
+    }
+    sql += " ORDER BY id DESC LIMIT ?";
+    params.push(opts.limit ?? 20);
+    return (this.db.prepare(sql).all(...(params as any[])) as unknown as ScenarioRow[]).map(rowToScenario);
   }
 
   // ---- places -------------------------------------------------------------
@@ -287,6 +398,44 @@ export class DB {
     return (this.db.prepare(sql).all(...(params as any[])) as unknown as PlaceRow[]).map(rowToPlace);
   }
 
+  // ---- aliases / local canonicalization ----------------------------------
+  addPlaceAlias(userId: string, alias: string, placeId: string): PlaceAlias {
+    const normalized = normalizeAlias(alias);
+    const createdAt = nowIso();
+    this.db
+      .prepare(
+        `INSERT INTO place_aliases (user_id, alias, normalized, place_id, created_at)
+         VALUES (?, ?, ?, ?, ?)
+         ON CONFLICT(user_id, normalized) DO UPDATE SET alias=excluded.alias, place_id=excluded.place_id`,
+      )
+      .run(userId, alias.trim(), normalized, placeId, createdAt);
+    return { userId, alias: alias.trim(), normalized, placeId, createdAt };
+  }
+
+  resolvePlaceAlias(userId: string, alias: string): string | null {
+    const normalized = normalizeAlias(alias);
+    const row = this.db
+      .prepare("SELECT place_id FROM place_aliases WHERE user_id=? AND normalized=?")
+      .get(userId, normalized) as { place_id: string } | undefined;
+    return row?.place_id ?? null;
+  }
+
+  aliasesForPlace(userId: string, placeId: string): PlaceAlias[] {
+    return (
+      this.db
+        .prepare("SELECT user_id, alias, normalized, place_id, created_at FROM place_aliases WHERE user_id=? AND place_id=? ORDER BY alias")
+        .all(userId, placeId) as unknown as AliasRow[]
+    ).map(rowToAlias);
+  }
+
+  listPlaceAliases(userId: string): PlaceAlias[] {
+    return (
+      this.db
+        .prepare("SELECT user_id, alias, normalized, place_id, created_at FROM place_aliases WHERE user_id=? ORDER BY alias")
+        .all(userId) as unknown as AliasRow[]
+    ).map(rowToAlias);
+  }
+
   allPlacesWithEmbeddings(limit = 5000): Array<{ place: Place; embedding: Float32Array | null }> {
     const rows = this.db.prepare("SELECT * FROM places LIMIT ?").all(limit) as unknown as PlaceRow[];
     return rows.map((r) => ({ place: rowToPlace(r), embedding: r.embedding ? blobToF32(r.embedding) : null }));
@@ -296,11 +445,11 @@ export class DB {
   addMemory(mem: Memory): number {
     const res = this.db
       .prepare(
-        `INSERT INTO memories (user_id,place_id,relationship,affect,note,companions,occurred_at,created_at,source)
-         VALUES (?,?,?,?,?,?,?,?,?)`,
+        `INSERT INTO memories (user_id,place_id,relationship,affect,note,companions,occurred_at,created_at,source,source_refs)
+         VALUES (?,?,?,?,?,?,?,?,?,?)`,
       )
       .run(mem.userId, mem.placeId, mem.relationship, mem.affect, mem.note,
-        JSON.stringify(mem.companions), mem.occurredAt, mem.createdAt, mem.source);
+        JSON.stringify(mem.companions), mem.occurredAt, mem.createdAt, mem.source, JSON.stringify(mem.sourceRefs ?? []));
     return Number(res.lastInsertRowid);
   }
 
@@ -403,14 +552,14 @@ export class DB {
   upsertBelief(b: Belief): void {
     this.db
       .prepare(
-        `INSERT INTO beliefs (user_id,subject,predicate,object,otype,confidence,support,source,updated_at)
-         VALUES (?,?,?,?,?,?,?,?,?)
+        `INSERT INTO beliefs (user_id,subject,predicate,object,otype,confidence,support,provenance,source,updated_at)
+         VALUES (?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(user_id,subject,predicate,object) DO UPDATE SET
-           confidence=excluded.confidence, support=excluded.support,
+           confidence=excluded.confidence, support=excluded.support, provenance=excluded.provenance,
            source=excluded.source, otype=excluded.otype, updated_at=excluded.updated_at`,
       )
       .run(b.userId, b.subject, b.predicate, b.object, b.otype, b.confidence,
-        JSON.stringify(b.support), b.source, b.updatedAt);
+        JSON.stringify(b.support), JSON.stringify(b.provenance ?? []), b.source, b.updatedAt);
   }
 
   getBelief(userId: string, subject: string, predicate: Predicate, object: string): Belief | null {
@@ -543,6 +692,7 @@ interface PlaceRow {
 interface MemoryRow {
   id: number; user_id: string | null; place_id: string; relationship: string; affect: number;
   note: string | null; companions: string | null; occurred_at: string | null; created_at: string | null; source: string | null;
+  source_refs: string | null;
 }
 interface EventRow {
   id: number; user_id: string; kind: string; text: string | null; place_id: string | null;
@@ -550,7 +700,14 @@ interface EventRow {
 }
 interface BeliefRow {
   id: number; user_id: string; subject: string; predicate: string; object: string; otype: string;
-  confidence: number; support: string | null; source: string | null; updated_at: string | null;
+  confidence: number; support: string | null; provenance: string | null; source: string | null; updated_at: string | null;
+}
+interface ScenarioRow {
+  id: number; user_id: string; title: string; summary: string; turn_ids: string; place_ids: string;
+  concepts: string; intents: string; started_at: string | null; ended_at: string | null; created_at: string | null;
+}
+interface AliasRow {
+  user_id: string; alias: string; normalized: string; place_id: string; created_at: string;
 }
 
 function rowToPlace(r: PlaceRow): Place {
@@ -566,6 +723,7 @@ function rowToMemory(r: MemoryRow): Memory {
     id: r.id, userId: r.user_id ?? "default", placeId: r.place_id, relationship: r.relationship as Relationship,
     affect: r.affect, note: r.note, companions: r.companions ? (JSON.parse(r.companions) as string[]) : [],
     occurredAt: r.occurred_at, createdAt: r.created_at ?? nowIso(), source: r.source ?? "manual",
+    sourceRefs: parseJson<ProvenanceRef[]>(r.source_refs, []),
   };
 }
 function rowToEvent(r: EventRow): OmEvent {
@@ -581,8 +739,45 @@ function rowToBelief(r: BeliefRow): Belief {
     id: r.id, userId: r.user_id, subject: r.subject, predicate: r.predicate as Belief["predicate"],
     object: r.object, otype: r.otype as Belief["otype"], confidence: r.confidence,
     support: r.support ? (JSON.parse(r.support) as string[]) : [], source: (r.source ?? "inferred") as Belief["source"],
+    provenance: parseJson<ProvenanceRef[]>(r.provenance, []),
     updatedAt: r.updated_at ?? nowIso(),
   };
+}
+function rowToScenario(r: ScenarioRow): Scenario {
+  return {
+    id: r.id,
+    userId: r.user_id,
+    title: r.title,
+    summary: r.summary,
+    turnIds: JSON.parse(r.turn_ids) as number[],
+    placeIds: JSON.parse(r.place_ids) as string[],
+    concepts: JSON.parse(r.concepts) as string[],
+    intents: JSON.parse(r.intents) as string[],
+    startedAt: r.started_at,
+    endedAt: r.ended_at,
+    createdAt: r.created_at ?? nowIso(),
+  };
+}
+function rowToAlias(r: AliasRow): PlaceAlias {
+  return { userId: r.user_id, alias: r.alias, normalized: r.normalized, placeId: r.place_id, createdAt: r.created_at };
+}
+
+function normalizeAlias(alias: string): string {
+  return alias
+    .normalize("NFKC")
+    .toLowerCase()
+    .replace(/[“”"']/g, "")
+    .replace(/\s+/g, " ")
+    .trim();
+}
+
+function parseJson<T>(s: string | null, fallback: T): T {
+  if (!s) return fallback;
+  try {
+    return JSON.parse(s) as T;
+  } catch {
+    return fallback;
+  }
 }
 
 function f32ToBlob(v: Float32Array): Uint8Array {

@@ -1,7 +1,7 @@
 import { type Config } from "../core/config.js";
 import { type Relationship } from "../core/types.js";
 import { type LLMRunner, extractJson } from "./llm.js";
-import { type Measure, HeuristicExtractor, extractMeasures, inferCompanion, inferRelationship } from "./extract.js";
+import { type Measure, HeuristicExtractor, extractConcepts, extractMeasures, inferCompanion, inferRelationship } from "./extract.js";
 import { lexiconFrame } from "./tagger.js";
 import { MEMORY_RELATIONSHIPS, buildMemoryPrompt } from "../prompts/memory.js";
 
@@ -34,16 +34,55 @@ export class HeuristicMemoryExtractor implements MemoryExtractor {
     const relationship = inferRelationship(text) as Relationship;
     const companion = inferCompanion(text);
     const goal = lexiconFrame(text).goals[0] ?? null;
-    const measures = extractMeasures(`${opts.context ?? ""} ${text}`);
+    const full = `${opts.context ?? ""} ${text}`.trim();
+    const fullMeasures = extractMeasures(full);
     return names.map((name) => ({
       name,
-      relationship,
+      relationship: scopedRelationship(text, name, relationship),
       companions: companion ? [companion] : [],
-      region: null,
-      measures,
+      region: scopedRegion(full, text, name),
+      measures: scopedMeasures(full, text, name, fullMeasures),
       goal,
+      concepts: scopedConcepts(full, text, name),
     }));
   }
+}
+
+const CLAUSE_SPLIT = /\s*(?:,?\s+but\s+|;\s*|\.\s+|,\s+and\s+)\s*/i;
+const REGION_RE = /\b(?:in|around|near)\s+([A-Z][A-Za-z.'-]+(?:\s+[A-Z][A-Za-z.'-]+){0,3})\b/;
+
+function clauseForName(text: string, name: string): string {
+  return text.split(CLAUSE_SPLIT).find((c) => c.includes(name)) ?? text;
+}
+
+function scopedRelationship(text: string, name: string, fallback: Relationship): Relationship {
+  const rel = inferRelationship(clauseForName(text, name)) as Relationship;
+  return rel === "mentioned" ? fallback : rel;
+}
+
+function scopedConcepts(full: string, text: string, name: string): string[] {
+  return [...new Set([...extractConcepts(clauseForName(full, name)), ...extractConcepts(clauseForName(text, name))])];
+}
+
+function scopedRegion(full: string, text: string, name: string): string | null {
+  const specific = clauseForName(full, name).match(REGION_RE)?.[1];
+  if (specific) return specific;
+  return clauseForName(text, name).match(REGION_RE)?.[1] ?? null;
+}
+
+function scopedMeasures(full: string, text: string, name: string, fallback: Measure[]): Measure[] {
+  const scoped = extractMeasures(`${clauseForName(full, name)} ${clauseForName(text, name)}`);
+  if (!scoped.length) return fallback;
+  const out = [...scoped];
+  const seen = new Set(out.map((m) => m.term));
+  for (const term of ["budget", "walk_time", "transit_walk"]) {
+    if (seen.has(term)) continue;
+    const matches = fallback.filter((m) => m.term === term);
+    if (matches.length !== 1) continue;
+    out.push(matches[0]!);
+    seen.add(term);
+  }
+  return out;
 }
 
 export class LLMMemoryExtractor implements MemoryExtractor {
@@ -59,26 +98,63 @@ export class LLMMemoryExtractor implements MemoryExtractor {
       const content = await this.runner.run({ prompt, json: true, model: this.model });
       const parsed = JSON.parse(extractJson(content || "{}"));
       const places = Array.isArray(parsed.places) ? parsed.places : [];
+      const fallback = await this.fallback.extract(text, opts);
+      const fallbackByName = new Map(fallback.map((p) => [p.name.toLowerCase(), p]));
       const out: ExtractedPlace[] = places
         .filter((p: any) => p && typeof p.name === "string" && p.name.trim())
-        .map((p: any) => ({
-          name: String(p.name).trim(),
-          relationship: (MEMORY_RELATIONSHIPS.includes(p.relationship) ? p.relationship : "mentioned") as Relationship,
-          companions: Array.isArray(p.companions) ? p.companions.map(String) : [],
-          region: p.region ? String(p.region) : null,
-          measures: Array.isArray(p.measures)
-            ? p.measures
-                .filter((m: any) => ["near", "walk_time", "budget"].includes(m?.term) && Number.isFinite(Number(m?.value)))
-                .map((m: any) => ({ term: String(m.term), value: Number(m.value) }))
-            : [],
-          goal: p.goal ? String(p.goal) : null,
-          concepts: Array.isArray(p.concepts) ? p.concepts.map((c: unknown) => String(c).toLowerCase().trim()).filter(Boolean) : [],
-        }));
+        .map((p: any) => {
+          const name = String(p.name).trim();
+          const fb = fallbackByName.get(name.toLowerCase());
+          const measures = mergeMeasures(
+            sanitizeMeasures(Array.isArray(p.measures) ? p.measures : []),
+            fb?.measures ?? [],
+          );
+          const concepts = [
+            ...new Set([
+              ...sanitizeConcepts(Array.isArray(p.concepts) ? p.concepts : []),
+              ...(fb?.concepts ?? []),
+            ]),
+          ];
+          return {
+            name,
+            relationship: (MEMORY_RELATIONSHIPS.includes(p.relationship) ? p.relationship : fb?.relationship ?? "mentioned") as Relationship,
+            companions: Array.isArray(p.companions) ? p.companions.map(String) : fb?.companions ?? [],
+            region: p.region ? String(p.region) : fb?.region ?? null,
+            measures,
+            goal: p.goal ? String(p.goal) : fb?.goal ?? null,
+            concepts,
+          };
+        });
       return out.length ? out : this.fallback.extract(text, opts);
     } catch {
       return this.fallback.extract(text, opts);
     }
   }
+}
+
+const VALID_MEASURE_TERMS = new Set(["near", "walk_time", "budget", "noise", "crowd", "transit_walk"]);
+
+function sanitizeMeasures(items: unknown[]): Measure[] {
+  return items
+    .map((m: any) => ({ term: String(m?.term ?? "").toLowerCase().trim(), value: Number(m?.value) }))
+    .filter((m: Measure) => VALID_MEASURE_TERMS.has(m.term) && Number.isFinite(m.value) && (m.term === "noise" || m.term === "crowd" ? m.value >= 0 : m.value > 0));
+}
+
+function mergeMeasures(primary: Measure[], fallback: Measure[]): Measure[] {
+  const out = [...primary];
+  const seen = new Set(out.map((m) => m.term));
+  for (const m of fallback) {
+    if (!VALID_MEASURE_TERMS.has(m.term) || seen.has(m.term)) continue;
+    out.push(m);
+    seen.add(m.term);
+  }
+  return out;
+}
+
+function sanitizeConcepts(items: unknown[]): string[] {
+  return items
+    .map((c: unknown) => String(c).toLowerCase().trim())
+    .filter((c: string) => c && !/^not[-_\s]?/.test(c));
 }
 
 export function getMemoryExtractor(cfg: Config, runner: LLMRunner | null): MemoryExtractor {

@@ -1,6 +1,6 @@
 import { type DB } from "../store/db.js";
-import { conceptsFromTags, extractConcepts } from "../nlp/extract.js";
-import { type Belief, type Memory, type Predicate, type Relationship, nowIso } from "../core/types.js";
+import { conceptsFromTags, extractConcepts, inferRelationship } from "../nlp/extract.js";
+import { type Belief, type Memory, type Predicate, type ProvenanceRef, type Relationship, nowIso } from "../core/types.js";
 
 // ── reconcile: decide ADD / UPDATE / NOOP for a new place observation ───────
 export type ReconcileAction = "add" | "update" | "noop";
@@ -68,11 +68,21 @@ export interface Inference {
   likely: boolean;
   source: "inferred" | "stated";
   because: string[];
+  provenance: ProvenanceRef[];
 }
 
-/** Infer a user→concept preference from behavior (events) + felt experience
- * (loved/visited places tagged with the concept). Drill-down: if a stated
- * belief exists it pins confidence high (stated > inferred). */
+export interface RepairAction {
+  action: "delete_conflicting_belief";
+  object: string;
+  kept: { id: number | null; predicate: Predicate; confidence: number; source: "inferred" | "stated" };
+  removed: { id: number | null; predicate: Predicate; confidence: number; source: "inferred" | "stated" };
+  reason: string;
+}
+
+/** Infer a user→concept preference from behavior (events) + felt experience.
+ * `likes` can use repeated search/mention behavior; `avoids` is stricter and
+ * comes from negative place experiences, because a query alone is not dislike.
+ * If a stated belief exists it pins confidence high (stated > inferred). */
 export function inferConcept(
   db: DB,
   userId: string,
@@ -87,13 +97,21 @@ export function inferConcept(
 
   let signal = 0;
   const because: string[] = [];
-  for (const e of events) {
-    signal += EVENT_WEIGHT;
-    because.push(`event#${e.id}:${e.kind}("${e.text.slice(0, 40)}")`);
+  const provenance: ProvenanceRef[] = [];
+  if (predicate === "likes") {
+    for (const e of events) {
+      if (inferRelationship(e.text) === "disliked") continue;
+      signal += EVENT_WEIGHT;
+      because.push(`event#${e.id}:${e.kind}("${e.text.slice(0, 40)}")`);
+      provenance.push({ kind: "event", id: e.id, label: e.kind, snippet: e.text.slice(0, 220) });
+    }
   }
   for (const r of remembered) {
-    signal += Math.max(0, r.aggAffect);
+    const affectSignal = predicate === "avoids" ? Math.max(0, -r.aggAffect) : Math.max(0, r.aggAffect);
+    if (affectSignal <= 0) continue;
+    signal += affectSignal;
     because.push(`place:${r.place.name}(${r.relationship})`);
+    provenance.push({ kind: "place", id: r.place.id, label: `${r.relationship} ${r.place.name}` });
   }
 
   let confidence = 1 - Math.exp(-K * signal);
@@ -110,6 +128,7 @@ export function inferConcept(
     likely: confidence >= LIKELY,
     source,
     because: because.slice(0, 8),
+    provenance: source === "stated" ? [{ kind: "stated", id: existing?.id ?? null, label: `${predicate} ${concept}` }] : provenance.slice(0, 12),
   };
 }
 
@@ -122,7 +141,7 @@ export function ask(db: DB, userId: string, question: string): Inference & { que
   if (concepts.length === 0) {
     return {
       question, subject: "user", predicate, object: "", confidence: 0, likely: false,
-      source: "inferred", because: ["no recognized concept in question"],
+      source: "inferred", because: ["no recognized concept in question"], provenance: [],
     };
   }
   return { question, ...inferConcept(db, userId, concepts[0]!, predicate) };
@@ -145,15 +164,17 @@ export function consolidate(db: DB, userId: string): Belief[] {
   const written: Belief[] = [];
 
   for (const concept of concepts) {
-    const inf = inferConcept(db, userId, concept, "likes");
-    if (inf.source === "stated") continue; // don't overwrite stated beliefs
-    if (inf.confidence < CONSOLIDATE_MIN) continue;
-    const belief: Belief = {
-      id: null, userId, subject: "user", predicate: "likes", object: concept, otype: "concept",
-      confidence: inf.confidence, support: inf.because, source: "inferred", updatedAt: nowIso(),
-    };
-    db.upsertBelief(belief);
-    written.push(belief);
+    for (const predicate of ["likes", "avoids"] as const) {
+      const inf = inferConcept(db, userId, concept, predicate);
+      if (inf.source === "stated") continue; // don't overwrite stated beliefs
+      if (inf.confidence < CONSOLIDATE_MIN) continue;
+      const belief: Belief = {
+        id: null, userId, subject: "user", predicate, object: concept, otype: "concept",
+        confidence: inf.confidence, support: inf.because, provenance: inf.provenance, source: "inferred", updatedAt: nowIso(),
+      };
+      db.upsertBelief(belief);
+      written.push(belief);
+    }
   }
 
   // recurring intents → a `pursues` goal belief
@@ -162,11 +183,54 @@ export function consolidate(db: DB, userId: string): Belief[] {
     const confidence = round(1 - Math.exp(-K * count * EVENT_WEIGHT));
     const belief: Belief = {
       id: null, userId, subject: "user", predicate: "pursues", object: purpose, otype: "goal",
-      confidence, support: [`intent x${count}`], source: "inferred", updatedAt: nowIso(),
+      confidence,
+      support: [`intent x${count}`],
+      provenance: events.filter((e) => e.intents.includes(purpose)).slice(0, 12).map((e) => ({ kind: "event", id: e.id, label: e.kind, snippet: e.text.slice(0, 220) })),
+      source: "inferred",
+      updatedAt: nowIso(),
     };
     db.upsertBelief(belief);
     written.push(belief);
   }
 
   return written;
+}
+
+/** Repair old DBs where earlier inference may have persisted both
+ * `user likes X` and `user avoids X`. Stated beliefs are preserved over inferred
+ * ones; otherwise the higher-confidence edge wins. */
+export function repairContradictions(db: DB, userId: string): RepairAction[] {
+  const beliefs = db.listBeliefs(userId).filter((b) => b.subject === "user" && b.otype === "concept");
+  const likes = new Map(beliefs.filter((b) => b.predicate === "likes").map((b) => [b.object, b]));
+  const avoids = new Map(beliefs.filter((b) => b.predicate === "avoids").map((b) => [b.object, b]));
+  const actions: RepairAction[] = [];
+
+  for (const [object, like] of likes) {
+    const avoid = avoids.get(object);
+    if (!avoid) continue;
+    const kept = chooseBeliefToKeep(like, avoid);
+    const removed = kept === like ? avoid : like;
+    if (removed.source === "stated" && kept.source === "stated") continue; // explicit user conflict: surface, don't mutate
+    if (removed.id == null) continue;
+    db.deleteBelief(userId, removed.id);
+    actions.push({
+      action: "delete_conflicting_belief",
+      object,
+      kept: beliefRef(kept),
+      removed: beliefRef(removed),
+      reason: kept.source === "stated" ? "stated belief wins" : "higher confidence wins",
+    });
+  }
+  return actions;
+}
+
+function chooseBeliefToKeep(a: Belief, b: Belief): Belief {
+  if (a.source === "stated" && b.source !== "stated") return a;
+  if (b.source === "stated" && a.source !== "stated") return b;
+  if (a.confidence !== b.confidence) return a.confidence > b.confidence ? a : b;
+  return b.predicate === "avoids" ? b : a;
+}
+
+function beliefRef(b: Belief): RepairAction["kept"] {
+  return { id: b.id, predicate: b.predicate, confidence: b.confidence, source: b.source };
 }

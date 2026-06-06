@@ -14,6 +14,14 @@ import { type Persona, type ScoredPlace } from "../core/types.js";
 import { type Anchors } from "./anchors.js";
 import { type Calibration } from "./calibration.js";
 
+export interface RecallBlockSource {
+  turnId: number;
+  role: string;
+  at: string | null;
+  snippet: string;
+}
+export type RecallBlockSources = Record<string, RecallBlockSource[]>;
+
 /** Persona block — stable across a session, so a host caches it on the system
  * prompt. Empty string when nothing is known yet (don't inject noise). */
 export function formatPersonaContext(persona: Persona, anchors: Anchors, calibrations: Calibration[]): string {
@@ -46,13 +54,15 @@ export function formatPersonaContext(persona: Persona, anchors: Anchors, calibra
 }
 
 /** Relevant-places block — dynamic per turn, prepended to the user message. */
-export function formatRecallBlock(places: ScoredPlace[]): string {
+export function formatRecallBlock(places: ScoredPlace[], sources: RecallBlockSources = {}): string {
   if (!places.length) return "";
   const rows = places.map((p) => {
     const bits: string[] = [];
     if (p.relationship && p.relationship !== "mentioned") bits.push(p.relationship);
     if (p.place.tags?.length) bits.push(p.place.tags.slice(0, 4).join("/"));
     if (p.distanceKm != null) bits.push(`${p.distanceKm}km away`);
+    const src = sources[p.place.id]?.[0];
+    if (src) bits.push(`source turn#${src.turnId}`);
     const meta = bits.length ? ` (${bits.join("; ")})` : "";
     return `- ${p.place.name}${meta}`;
   });

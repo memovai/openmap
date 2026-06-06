@@ -40,8 +40,25 @@ export function lexiconFrame(text: string): IntentFrame {
   if (concepts.includes("cheap")) f.constraints.maxBudget = "low";
   if (concepts.includes("fancy")) f.constraints.maxBudget = "high";
   if (concepts.includes("vegetarian")) f.constraints.dietary = ["vegetarian"];
+  if (concepts.includes("open_late")) f.constraints.openNow = true;
+  if (concepts.includes("walkable")) {
+    f.constraints.walkable = true;
+    f.constraints.travelMode = "walk";
+  }
+  if (wantsQuiet(lower)) f.constraints.noise = "quiet";
+  else if (concepts.includes("loud")) f.constraints.noise = "loud";
+  if (wantsLowCrowd(lower)) f.constraints.crowd = "low";
+  else if (concepts.includes("crowded")) f.constraints.crowd = "high";
+  if (/\b(?:transit|station|subway|metro|train|bus)\b/.test(lower)) f.constraints.travelMode = "transit";
+  if (/\b(?:parking|drive|driving|car|valet)\b/.test(lower)) f.constraints.travelMode = "drive";
   return f;
 }
+
+const wantsQuiet = (lower: string) =>
+  /\b(?:quiet|calm|peaceful|low noise|not noisy|not loud|not too noisy|not too loud|without noise|avoid noise|avoid noisy|no loud music)\b/.test(lower);
+
+const wantsLowCrowd = (lower: string) =>
+  /\b(?:uncrowded|not crowded|not busy|not too crowded|not too busy|without crowds?|avoid crowds?|no crowds?|no line|no queue)\b/.test(lower);
 
 export class LexiconTagger implements Tagger {
   async frame(text: string): Promise<IntentFrame> {
@@ -81,12 +98,31 @@ export class LLMTagger implements Tagger {
       f.concepts = arr(p.concepts);
       f.vibe = arr(p.vibe);
       const c = p.constraints ?? {};
+      const choice = <T extends string>(x: unknown, allowed: readonly T[]): T | undefined => {
+        const v = x == null ? "" : String(x).toLowerCase().trim();
+        return (allowed as readonly string[]).includes(v) ? (v as T) : undefined;
+      };
       f.constraints = {
         openNow: typeof c.openNow === "boolean" ? c.openNow : undefined,
-        maxBudget: ["low", "mid", "high"].includes(c.maxBudget) ? c.maxBudget : undefined,
+        maxBudget: choice(c.maxBudget, ["low", "mid", "high"] as const),
         dietary: arr(c.dietary),
         walkable: typeof c.walkable === "boolean" ? c.walkable : undefined,
+        noise: choice(c.noise, ["quiet", "moderate", "loud"] as const),
+        crowd: choice(c.crowd, ["low", "moderate", "high"] as const),
+        travelMode: choice(c.travelMode, ["walk", "transit", "drive"] as const),
       };
+      const lexical = lexiconFrame(text);
+      f.goals = [...new Set([...f.goals, ...lexical.goals])].filter((g) => ALLOWED_GOALS.includes(g));
+      f.concepts = [...new Set([...f.concepts, ...lexical.concepts])];
+      f.vibe = [...new Set([...f.vibe, ...lexical.vibe])];
+      const merged = { ...lexical.constraints };
+      for (const [k, v] of Object.entries(f.constraints)) {
+        if (v !== undefined) (merged as Record<string, unknown>)[k] = v;
+      }
+      merged.dietary = [...new Set([...(lexical.constraints.dietary ?? []), ...(f.constraints.dietary ?? [])])];
+      f.constraints = merged;
+      if (f.companions && ["parents", "kids", "family"].includes(f.companions))
+        f.goals = f.goals.filter((g) => g !== "date" && g !== "romance");
       this.memo = { text, frame: f };
       return f;
     } catch {

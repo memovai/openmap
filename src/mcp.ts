@@ -85,7 +85,7 @@ export async function main(): Promise<void> {
     { query: z.string(), lat: z.number().optional(), lng: z.number().optional(), limit: z.number().optional(), userId: z.string().optional() },
     async (a: any) => {
       const ctx = await mem.recallContext(a.query, { near: near(a.lat, a.lng), limit: a.limit ?? 5, userId: a.userId });
-      return asText({ system: ctx.system, prepend: ctx.prepend, places: scored(ctx.places) });
+      return asText({ system: ctx.system, prepend: ctx.prepend, places: scored(ctx.places), sources: ctx.sources });
     },
   );
 
@@ -94,6 +94,36 @@ export async function main(): Promise<void> {
     "Search the raw conversation history (L0, BM25 keyword) to recall the user's original wording — use to ground or verify a recalled memory ('when did they say they loved X').",
     { query: z.string(), limit: z.number().optional(), userId: z.string().optional() },
     async (a: any) => asText({ turns: mem.searchConversation(a.query, { userId: a.userId, limit: a.limit ?? 10 }) }),
+  );
+
+  server.tool(
+    "scenarios",
+    "List L2 scenario summaries grouped from captured turns, places, concepts, and intents.",
+    { limit: z.number().optional(), placeId: z.string().optional(), intent: z.string().optional(), userId: z.string().optional() },
+    async (a: any) => asText({ scenarios: mem.scenarios(a.userId, { limit: a.limit ?? 20, placeId: a.placeId, intent: a.intent }) }),
+  );
+
+  server.tool(
+    "routines",
+    "List long-horizon routines derived from repeated L2 scenarios, e.g. quiet focus places or date-night patterns.",
+    {
+      limit: z.number().optional(),
+      scenarioLimit: z.number().optional(),
+      minScenarios: z.number().optional(),
+      intent: z.string().optional(),
+      concept: z.string().optional(),
+      userId: z.string().optional(),
+    },
+    async (a: any) =>
+      asText({
+        routines: mem.routines(a.userId, {
+          limit: a.limit ?? 20,
+          scenarioLimit: a.scenarioLimit ?? 200,
+          minScenarios: a.minScenarios ?? 2,
+          intent: a.intent,
+          concept: a.concept,
+        }),
+      }),
   );
 
   server.tool(
@@ -108,6 +138,13 @@ export async function main(): Promise<void> {
     "Promote the user's behavior (events) into persisted beliefs. Run periodically.",
     { userId: z.string().optional() },
     async (a: any) => asText({ written: mem.consolidate(a.userId) }),
+  );
+
+  server.tool(
+    "repair_contradictions",
+    "Repair old inferred graph contradictions, e.g. both user likes and avoids the same concept.",
+    { userId: z.string().optional() },
+    async (a: any) => asText({ repaired: mem.repairContradictions(a.userId) }),
   );
 
   server.tool(
@@ -133,9 +170,9 @@ export async function main(): Promise<void> {
 
   server.tool(
     "calibrate",
-    "Teach what a fuzzy place term means to this user from one accepted sample (revealed preference). term: near (km) | walk_time (min) | budget (spend) | noise (0..1). E.g. they picked a place 3km away → calibrate near 3.",
+    "Teach what a fuzzy place term means to this user from one accepted sample (revealed preference). term: near (km) | walk_time/transit_walk (min) | budget (spend) | noise/crowd (0..1). E.g. they picked a place 3km away → calibrate near 3.",
     {
-      term: z.enum(["near", "walk_time", "budget", "noise"]),
+      term: z.enum(["near", "walk_time", "budget", "noise", "crowd", "transit_walk"]),
       value: z.number(),
       context: z.string().optional(),
       userId: z.string().optional(),
@@ -148,7 +185,7 @@ export async function main(): Promise<void> {
 
   server.tool(
     "calibrations",
-    "The user's learned meaning of fuzzy terms (near/walk_time/budget/noise) — their personal place vocabulary.",
+    "The user's learned meaning of fuzzy terms (near/walk_time/budget/noise/crowd/transit_walk) — their personal place vocabulary.",
     { userId: z.string().optional() },
     async (a: any) => asText({ calibrations: mem.calibrations(a.userId) }),
   );
@@ -189,12 +226,26 @@ export async function main(): Promise<void> {
   );
 
   server.tool(
+    "add_place_alias",
+    "Add a per-user alias that resolves future place mentions to an existing canonical place.",
+    { alias: z.string(), placeId: z.string(), userId: z.string().optional() },
+    async (a: any) => asText(mem.addPlaceAlias(a.userId ?? "default", a.alias, a.placeId)),
+  );
+
+  server.tool(
+    "place_aliases",
+    "List per-user place aliases, optionally for one canonical place.",
+    { placeId: z.string().optional(), userId: z.string().optional() },
+    async (a: any) => asText({ aliases: mem.placeAliases(a.userId, a.placeId) }),
+  );
+
+  server.tool(
     "list_memories",
     "List the user's stored memories.",
     { relationship: relationshipSchema.optional(), limit: z.number().optional(), userId: z.string().optional() },
     async (a: any) => {
       const items = mem.listMemories(a.userId, { relationship: a.relationship, limit: a.limit ?? 50 });
-      return asText({ count: items.length, memories: items.map((it) => ({ id: it.memory.id, relationship: it.memory.relationship, affect: it.memory.affect, note: it.memory.note, place: it.place ? placeBrief(it.place) : null })) });
+      return asText({ count: items.length, memories: items.map((it) => ({ id: it.memory.id, relationship: it.memory.relationship, affect: it.memory.affect, note: it.memory.note, sourceRefs: it.memory.sourceRefs ?? [], place: it.place ? placeBrief(it.place) : null })) });
     },
   );
 

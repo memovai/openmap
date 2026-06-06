@@ -43,20 +43,74 @@
     {
       "title": "a quiet coffee spot",
       "turns": [{ "role": "user", "content": "loved \"Quiet Beans\", such a calm quiet coffee spot" }]
+    },
+    {
+      "title": "work-calls place preference and avoid",
+      "turns": [
+        { "role": "assistant", "content": "\"Botanica\" in Daikanyama is 1.2km away and quiet; \"Neon Alley\" in Shinjuku is 0.6km away but loud." },
+        { "role": "user", "content": "For solo work calls, pick \"Botanica\" — I loved the quiet tables." },
+        { "role": "user", "content": "I tried \"Neon Alley\" in Shinjuku later and disliked it, too noisy for calls." }
+      ]
+    },
+    {
+      "title": "late vegan walkable dinner",
+      "turns": [
+        { "role": "assistant", "content": "\"Moon Bowl\" is vegan, open late, an 8 minute walk, around ¥500. \"Burger Barn\" is meat-heavy and closes early." },
+        { "role": "user", "content": "After the show, pick \"Moon Bowl\" for dinner — I loved that it was walkable and still open." },
+        { "role": "user", "content": "I tried \"Burger Barn\" later and disliked it, closes too early and felt meat-heavy." }
+      ]
+    },
+    {
+      "title": "low-noise transit study",
+      "turns": [
+        { "role": "assistant", "content": "\"Study Hall\" is quiet, uncrowded, and next to a subway station. \"Arcade Plaza\" is packed and loud, but has parking." },
+        { "role": "user", "content": "For a low-noise study spot by train, pick \"Study Hall\" — I loved that it was uncrowded and next to the station." },
+        { "role": "user", "content": "I tried \"Arcade Plaza\" later and disliked it, too crowded and loud for studying." }
+      ]
+    },
+    {
+      "title": "repeat focus transit routine",
+      "turns": [
+        { "role": "assistant", "content": "\"Cowork Library\" is quiet, uncrowded, and beside the metro. \"Rush Hub\" is packed and loud." },
+        { "role": "user", "content": "For a study session, pick \"Cowork Library\" — I loved that it was quiet, uncrowded, and by the metro." },
+        { "role": "user", "content": "I tried \"Rush Hub\" later and disliked it, too loud and crowded for studying." }
+      ]
     }
   ],
   "probes": [
-    { "kind": "recall", "category": "single-hop", "query": "a good coffee place", "expectTop": "Ritual Coffee" },
+    { "kind": "recall", "category": "single-hop", "query": "a good coffee place", "expectIncludes": "Ritual Coffee" },
     { "kind": "ask", "category": "preference", "question": "do I like coffee?", "expectLikely": true },
     { "kind": "ask", "category": "preference", "question": "do I like ramen?", "expectLikely": true },
     { "kind": "ask", "category": "adversarial", "question": "do I like sushi?", "expectLikely": false },
     { "kind": "belief", "category": "preference", "predicate": "likes", "object": "coffee" },
     { "kind": "calibration", "category": "spatial", "term": "near", "expect": 6 },
     { "kind": "calibration", "category": "spatial-context", "term": "near", "context": "date", "expect": 6 },
-    { "kind": "calibration", "category": "spatial", "term": "budget", "min": 500 },
+    { "kind": "calibration", "category": "budget-context", "term": "budget", "context": "date", "min": 500 },
     { "kind": "reconcile", "category": "update", "place": "Ramen Nagi", "expectCount": 1, "expectRelationship": "loved" },
     { "kind": "memory", "category": "sentiment", "place": "Loud Sports Bar", "expectRelationship": "disliked" },
     { "kind": "calibration", "category": "spatial", "term": "walk_time", "min": 12 },
+    { "kind": "recall", "category": "assistant-map", "query": "a quiet place for solo work calls", "expectTop": "Botanica", "expectNotTop": "Neon Alley" },
+    { "kind": "memory", "category": "negative-place", "place": "Neon Alley", "expectRelationship": "disliked" },
+    { "kind": "ask", "category": "avoidance", "question": "do I avoid noisy places?", "expectLikely": true },
+    { "kind": "belief", "category": "avoidance", "predicate": "avoids", "object": "loud" },
+    { "kind": "belief", "category": "contradiction", "predicate": "likes", "object": "loud", "expectPresent": false },
+    { "kind": "calibration", "category": "spatial-context", "term": "near", "context": "work", "expect": 1.2 },
+    { "kind": "conversation", "category": "grounding", "query": "too noisy calls", "expectIncludes": "Neon Alley" },
+    { "kind": "persona", "category": "assistant-context", "query": "somewhere quiet for calls", "expectSystemIncludes": ["Avoids", "loud"], "expectPrependIncludes": ["Botanica"] },
+    { "kind": "citation", "category": "source-trace", "query": "somewhere quiet for calls", "place": "Botanica", "expectIncludes": "loved the quiet tables" },
+    { "kind": "scenario", "category": "scenario-layer", "expectPlace": "Botanica", "expectOtherPlace": "Neon Alley", "expectIntent": "work", "expectNotIntent": "solo work calls", "expectConcept": "quiet", "expectNotConcept": "not-quiet", "expectConceptsExclude": ["quiet_tables", "not-touristy", "not_burger"], "expectTitleIncludes": ["work"], "expectTitleExcludes": ["solo:"], "expectSummaryIncludes": ["preferred Botanica", "avoided Neon Alley"], "minTurns": 3 },
+    { "kind": "recall", "category": "constraints", "query": "open late vegan walkable dinner", "expectTop": "Moon Bowl", "expectNotTop": "Burger Barn" },
+    { "kind": "memory", "category": "constraint-negative", "place": "Burger Barn", "expectRelationship": "disliked" },
+    { "kind": "recall", "category": "ambient-travel", "query": "quiet uncrowded study spot near the subway", "expectTop": "Study Hall", "expectNotTop": "Arcade Plaza" },
+    { "kind": "memory", "category": "ambient-negative", "place": "Arcade Plaza", "expectRelationship": "disliked" },
+    { "kind": "belief", "category": "ambient-avoidance", "predicate": "avoids", "object": "crowded" },
+    { "kind": "calibration", "category": "ambient-calibration", "term": "noise", "max": 0.35 },
+    { "kind": "calibration", "category": "ambient-calibration", "term": "crowd", "max": 0.35 },
+    { "kind": "calibration", "category": "travel-calibration", "term": "transit_walk", "min": 1, "max": 5 },
+    { "kind": "calibration", "category": "ambient-context", "term": "noise", "context": "study", "max": 0.35 },
+    { "kind": "scenario", "category": "scenario-synthesis", "expectPlace": "Study Hall", "expectOtherPlace": "Arcade Plaza", "expectIntent": "study", "expectConceptsInclude": ["quiet", "low_crowd", "transit", "loud", "crowded"], "expectConceptsExclude": ["low-noise", "quiet_tables", "meat-heavy", "not-touristy"], "expectTitleIncludes": ["study"], "expectSummaryIncludes": ["preferred Study Hall", "avoided Arcade Plaza"], "minTurns": 3 },
+    { "kind": "routine", "category": "scenario-rollup", "expectPositivePlace": "Cowork Library", "expectNegativePlace": "Rush Hub", "expectIntentsInclude": ["work", "study"], "expectConceptsInclude": ["quiet", "low_crowd", "transit"], "expectTitleIncludes": ["focus"], "expectSummaryIncludes": ["intents", "work", "study", "near transit", "preferred", "avoided"], "minScenarios": 3, "minConfidence": 0.8 },
+    { "kind": "graph", "category": "symbolic-memory", "expectIncludes": ["graph LR", "avoids", "loud", "Neon Alley"] },
     { "kind": "memory", "category": "mixed-sentiment", "place": "Stellar", "expectRelationship": "loved", "llmOnly": true },
     { "kind": "memory", "category": "mixed-sentiment", "place": "Dud Diner", "expectRelationship": "disliked", "llmOnly": true },
     { "kind": "recall", "category": "multi-hop", "query": "a quiet coffee spot", "expectTop": "Quiet Beans", "llmOnly": true },

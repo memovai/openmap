@@ -40,7 +40,16 @@
     "typecheck": "tsc -p tsconfig.json --noEmit",
     "eval": "tsx eval/run.ts",
     "eval:compare": "tsx eval/compare.ts",
+    "eval:replay": "tsx eval/replay.ts",
+    "eval:replay:diff": "tsx eval/replay-diff.ts",
+    "eval:all": "tsx eval/suites.ts",
+    "eval:all:compare": "tsx eval/suites.ts --mode=compare",
+    "eval:all:replay": "tsx eval/suites.ts --mode=replay",
+    "eval:field": "tsx eval/run.ts --dataset=field-dataset.json",
+    "eval:field:compare": "tsx eval/compare.ts --dataset=field-dataset.json",
+    "eval:field:replay": "tsx eval/replay.ts --dataset=field-dataset.json",
     "eval:recall": "tsx eval/recall.ts",
+    "eval:providers": "tsx eval/provider-compare.ts",
     "mcp": "tsx src/mcp.ts"
   },
   "dependencies": {

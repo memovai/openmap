@@ -7,7 +7,7 @@ process.on("warning", (w) => {
 
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { buildOpenMap } from "../src/openmap.js";
 import { loadConfig } from "../src/core/config.js";
 import { getRunner } from "../src/nlp/llm.js";
@@ -16,6 +16,14 @@ import { StubLLMRunner } from "./stub-llm.js";
 import { type LLMRunner } from "../src/nlp/llm.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
+
+function argValue(name: string, fallback: string): string {
+  return process.argv.find((a) => a.startsWith(`${name}=`))?.slice(name.length + 1) ?? fallback;
+}
+
+function resolveDatasetPath(path: string): string {
+  return isAbsolute(path) ? path : join(here, path);
+}
 
 /** Run the dataset under offline vs LLM pipelines. The LLM runner is the real
  * model when a key is set, else a transparent stub — or an injected one (tests
@@ -41,7 +49,8 @@ export async function compare(
 }
 
 async function main() {
-  const dataset = JSON.parse(await readFile(join(here, "dataset.json"), "utf-8")) as EvalDataset;
+  const datasetPath = resolveDatasetPath(argValue("--dataset", "dataset.json"));
+  const dataset = JSON.parse(await readFile(datasetPath, "utf-8")) as EvalDataset;
   const { offline, llm, live, model } = await compare(dataset);
   const icon = (s: string) => (s === "pass" ? "✓" : s === "fail" ? "✗" : "–");
 

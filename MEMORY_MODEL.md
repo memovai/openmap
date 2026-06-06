@@ -23,7 +23,9 @@ Triples `(subject, predicate, object)` with **confidence + provenance + source**
 `user —likes→ coffee` (0.7, from N events), `user —lives_near→ place`,
 `user —avoids→ loud`, `user —pursues→ date`. Promoted from events by
 `consolidate()`; reconciled (ADD / UPDATE / NOOP); inferred beliefs **decay** with
-recency, stated ones don't (stated > inferred).
+recency, stated ones don't (stated > inferred). Beliefs carry structured
+provenance refs (`event`, `place`, `turn`, `stated`) in addition to compact support
+strings, so replay/audit tooling can drill back to evidence.
 
 ### L3 — Persona (per user)
 The distilled profile = stated preferences merged with derived ones (top beliefs).
@@ -63,16 +65,18 @@ sentiment flip (loved → disliked) → UPDATE (latest wins); same → NOOP.
 Vectors answer "what's similar"; they can't answer "where's home", "who did I go
 with", or "what does *near* mean to me". Those are relations and learned scalars —
 first-class in the belief graph and the calibration layer. Vectors are used for
-*retrieval* of nodes, not as the model itself.
+*retrieval* of nodes, not as the model itself. Symbolic beliefs also feed recall
+ranking directly: a derived `avoids loud` edge penalizes loud remembered places,
+while `likes quiet` / `pursues work` can boost matching places.
 
 ## Repository layout
 
 ```
 core/   types · geo · config
-store/  db.ts (SQLite + sqlite-vec)
+store/  db.ts (SQLite + sqlite-vec, migrations, aliases)
 nlp/    embedding · extract · tagger
-memory/ inference · taste · persona · anchors · regions · calibration · graph
+memory/ inference · taste · persona · anchors · regions · calibration · graph · scenarios
 world/  affordance · relations
-search/ ranking
+search/ recall · ranking
 openmap.ts (facade) · cli.ts · mcp.ts · index.ts
 ```

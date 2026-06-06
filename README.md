@@ -64,9 +64,10 @@ openmap -u alice graph --mermaid                   # the knowledge graph as Merm
 
 # learned spatial vocabulary + areas
 openmap -u alice calibrate near 3                  # "near" ≈ 3km for me (or learn-near 3)
-openmap -u alice calibrations                      # near/walk_time/budget/noise
+openmap -u alice calibrations                      # near/walk_time/budget/noise/crowd/transit_walk
 openmap -u alice anchors                           # home/work/usual area/near radius
 openmap -u alice regions                           # areas I'm active in
+openmap -u alice places alias "the plant cafe" <placeId> # canonicalize future mentions
 
 # persona, management, MCP
 openmap -u alice persona set --likes cozy,wine --dislikes loud
@@ -77,13 +78,14 @@ openmap serve-mcp
 ### Auto-learning from conversation
 
 `observe` doesn't just store — it learns. When the agent offers options with
-distances/prices and the user accepts one, openmap updates the calibration layer
-automatically (revealed preference):
+distances, prices, ambient fit, or transit access and the user accepts one,
+openmap updates the calibration layer automatically (revealed preference):
 
 ```
-assistant: "Ritual Coffee is 3km away, ¥45 pour-over"
+assistant: "Ritual Coffee is 3km away, ¥45 pour-over, quiet, uncrowded, next to the subway"
 user:      "let's do Ritual, loved it"
-            → remembers Ritual (loved) + learns near≈3km, budget≈¥45
+            → remembers Ritual (loved)
+            → learns near≈3km, budget≈¥45, noise≈0.2, crowd≈0.2, transit_walk≈2min
 ```
 
 ### Agent integration — auto-recall / auto-capture
@@ -101,7 +103,12 @@ await mem.capture([{ role: "user", content: userMessage }, { role: "assistant", 
 ```
 
 Raw turns are kept in an **L0 log** so the agent can recall original wording to ground a
-memory — `mem.searchConversation("the loud bar")` / the `conversation_search` MCP tool. As a
+memory — `mem.searchConversation("the loud bar")` / the `conversation_search` MCP tool.
+`recallContext()` also returns `sources[placeId]` and includes `source turn#...` citations
+in the recalled-places block when a raw turn supports a recalled place. Each capture with
+extraction also creates an L2 `scenario` summary grouping turn ids, place ids, concepts,
+and intents; repeated scenarios are rolled up on demand as `routines`, such as a durable
+"focus: quiet + near transit" pattern across work/study episodes. As a
 **Claude Code** hook: run `openmap recall-context "$PROMPT"` on `UserPromptSubmit` to inject
 context, and `openmap capture transcript.json` on `Stop` to capture the turn.
 
@@ -113,8 +120,10 @@ openmap serve-mcp
 ```
 
 Tools: `recall_context` (auto-recall), `capture` (auto-capture), `conversation_search`,
+`scenarios`, `routines`,
 `remember`, `observe`, `recall`, `resolve_intent`, `ask`, `consolidate`,
-`beliefs`, `graph`, `taste_profile`, `get_persona`, `set_persona`, `set_place_role`,
+`repair_contradictions`, `beliefs`, `graph`, `taste_profile`, `get_persona`, `set_persona`, `set_place_role`,
+`add_place_alias`, `place_aliases`,
 `anchors`, `regions`, `calibrate`, `calibrations`, `learn_near`, `list_memories`,
 `forget`, `list_collections`, `add_to_collection` (all accept an optional `userId`).
 
@@ -164,24 +173,72 @@ A thin `OpenMap` facade orchestrates focused modules — see
 [`ARCHITECTURE.md`](./ARCHITECTURE.md) and [`MEMORY_MODEL.md`](./MEMORY_MODEL.md):
 
 ```
-core/    types · geo · config            store/   sqlite + sqlite-vec + L0 turn log
-nlp/     embedding · extract · tagger     search/  ranking (rankMemory)
+core/    types · geo · config            store/   sqlite + sqlite-vec + migrations + aliases
+nlp/     embedding · extract · tagger     search/  recall pipeline · ranking
 prompts/ intent · mentions · memory       world/   affordance(vibe) · relations(near/similar)
 memory/  inference(beliefs+reconcile+decay) · taste · anchors · regions
-         · calibration(learned "near"…) · graph · persona · hooks(auto-recall/capture)
+         · calibration(near/walk/noise/crowd/transit thresholds) · graph · persona
+         · scenarios/routines · hooks(auto-recall/capture)
 ```
 
 Two linked geo layers: **objective facts** (`core/geo` distances) vs the
 **subjective spatial self-model** (`memory/calibration` learned near-radius,
-`memory/regions` frequented areas), joined at query time.
+noise/crowd/transit-access thresholds, `memory/regions` frequented areas), joined at query time.
 
 ## Development
 
 ```bash
 npm run typecheck   # tsc --noEmit
 npm test            # node:test, offline & network-free
+npm run eval        # dataset eval; uses .env.local LLM when configured
+npm run eval:compare # offline vs LLM/stub extraction comparison
+npm run eval:replay # JSON replay snapshot for ranking/memory regression tracking
+npm run eval:all    # aggregate all replay suites from eval/suites.json
+npm run eval:all:compare # aggregate offline vs LLM/stub comparison across suites
+npm run eval:all:replay -- --out=baseline.json # aggregate replay snapshot for CI/trends
+npm run eval:field  # broader field-style replay: cities/languages/use-cases
+npm run eval:field:compare # offline vs LLM on the field replay suite
+npm run eval:field:replay -- --out=field.json # field replay snapshot
+npm run eval:replay:diff -- before.json after.json # compare snapshots; exits non-zero on regressions
+npm run eval:providers -- --providers=openmap,mem0,tencentdb,gbrain --dataset=field-dataset.json
 npm run build
 ```
+
+### Cross-provider eval
+
+`eval:providers` runs the same dataset/probes against multiple memory systems and
+normalizes results into one report. `openmap` runs in-process. `mem0` is optional:
+install `mem0ai` and provide an OpenAI-compatible key. `tencentdb` and `gbrain`
+are command adapters so we can compare real deployments without vendoring their
+runtimes. All providers use the same `.env.local` / `.env` model settings loaded
+through `loadConfig()`:
+
+```bash
+# shared across openmap, mem0, TencentDB adapters, and gbrain adapters
+GEMINI_API_KEY=...
+OPENMAP_OPENAI_CHAT_MODEL=gemini-2.5-flash-lite
+OPENMAP_OPENAI_EMBED_MODEL=gemini-embedding-001
+OPENMAP_OPENAI_EMBED_DIMS=768
+
+# default: openmap, mem0, tencentdb, gbrain
+npm run eval:providers -- --dataset=dataset.json --out=provider-report.json
+
+# force deterministic openmap path
+npm run eval:providers -- --providers=openmap --offline
+
+# external adapters receive {schema, provider, dataset} on stdin and return
+# a ProviderEvalReport-compatible JSON object on stdout. They also inherit
+# OPENAI_API_KEY, OPENMAP_OPENAI_BASE_URL, OPENMAP_OPENAI_CHAT_MODEL,
+# OPENMAP_OPENAI_EMBED_MODEL, and OPENMAP_OPENAI_EMBED_DIMS.
+OPENMAP_EVAL_TENCENTDB_COMMAND="node ./adapters/tencentdb-eval.mjs" \
+OPENMAP_EVAL_GBRAIN_COMMAND="gbrain-eval-adapter --json" \
+npm run eval:providers -- --providers=openmap,tencentdb,gbrain
+```
+
+Unsupported capabilities are counted separately from failures. That keeps the
+comparison fair: generic memory systems can score on shared recall behavior
+without being penalized for openmap-specific map calibration, aliases, or
+place-graph probes they do not implement.
 
 ## References
 

@@ -1,0 +1,75 @@
+{
+  "name": "place-memory-field-replay",
+  "description": "Broader field-style map-assistant replay: varied cities, multilingual turns, travel/date/family/business/study workflows, ambient calibration, source grounding, and routine rollups.",
+  "user": "mira",
+  "sessions": [
+    {
+      "title": "late train vegan dinner in London",
+      "turns": [
+        { "role": "assistant", "content": "\"Night Noodle\" near King's Cross is vegan, open late, quiet, uncrowded, a 6 minute walk from the station, around £18. \"Queue Burger\" is crowded, loud, has a long line, and closes early." },
+        { "role": "user", "content": "After the delayed train, pick \"Night Noodle\" — I loved that it was vegan, quiet, uncrowded, and 6 minutes from the station." },
+        { "role": "user", "content": "I tried \"Queue Burger\" another night and disliked it, too crowded and loud after travel." }
+      ]
+    },
+    {
+      "title": "Paris quiet date",
+      "turns": [
+        { "role": "assistant", "content": "\"Canal Bistro\" in Paris is 4.5km away, romantic, quiet, and about €80. \"Club Rouge\" is 2km away but loud and crowded." },
+        { "role": "user", "content": "For date night with my partner, I loved \"Canal Bistro\"; the quiet romantic room was worth the 4.5km." },
+        { "role": "user", "content": "I disliked \"Club Rouge\" later, too loud and crowded for a date." }
+      ]
+    },
+    {
+      "title": "NYC stroller brunch",
+      "turns": [
+        { "role": "assistant", "content": "\"Maple Yard\" is outdoor, calm, stroller friendly, low crowd, a 10 minute walk, about $30. \"Tiny Counter\" is cramped, noisy, and packed." },
+        { "role": "user", "content": "For family brunch with the baby stroller, pick \"Maple Yard\" — loved the outdoor calm space and low crowd." },
+        { "role": "user", "content": "Skip \"Tiny Counter\" next time; I disliked how noisy and packed it felt." }
+      ]
+    },
+    {
+      "title": "Shanghai bilingual study",
+      "turns": [
+        { "role": "assistant", "content": "\"Jing'an Study Room\" in Jing'an is quiet, low-noise, near the metro, and uncrowded. \"Nanjing Arcade\" is packed, loud, and touristy." },
+        { "role": "user", "content": "下午要学习, pick \"Jing'an Study Room\" — loved the low-noise tables by the metro." },
+        { "role": "user", "content": "我后来 tried \"Nanjing Arcade\" and disliked it; too loud and crowded for studying." }
+      ]
+    },
+    {
+      "title": "Madrid client meeting",
+      "turns": [
+        { "role": "assistant", "content": "\"Cedar Table\" in Madrid is quiet, professional, near the metro, and has vegetarian options. \"Tapas Barrel\" is lively and loud." },
+        { "role": "user", "content": "For a client meeting, I loved \"Cedar Table\" because it was quiet, vegetarian-friendly, and close to transit." },
+        { "role": "user", "content": "I disliked \"Tapas Barrel\" for business; too loud for clients." }
+      ]
+    },
+    {
+      "title": "repeat family outdoor routine",
+      "turns": [
+        { "role": "assistant", "content": "\"Park Garden Cafe\" is outdoor, quiet, uncrowded, child-friendly, and a 7 minute walk from the bus. \"Mall Food Court\" is packed and loud." },
+        { "role": "user", "content": "For weekend family brunch, I loved \"Park Garden Cafe\" because it was outdoor, quiet, uncrowded, and close to the bus." },
+        { "role": "user", "content": "I disliked \"Mall Food Court\" with the kids, too packed and loud." }
+      ]
+    }
+  ],
+  "probes": [
+    { "kind": "recall", "category": "travel-dinner", "query": "vegan open late dinner near the station after a train", "expectTop": "Night Noodle", "expectNotTop": "Queue Burger" },
+    { "kind": "memory", "category": "travel-negative", "place": "Queue Burger", "expectRelationship": "disliked" },
+    { "kind": "calibration", "category": "travel-calibration", "term": "transit_walk", "min": 6, "max": 7 },
+    { "kind": "recall", "category": "date-night", "query": "quiet romantic date dinner", "expectTop": "Canal Bistro", "expectNotTop": "Club Rouge" },
+    { "kind": "calibration", "category": "date-distance", "term": "near", "context": "date", "expect": 4.5 },
+    { "kind": "calibration", "category": "date-budget", "term": "budget", "context": "date", "min": 80 },
+    { "kind": "recall", "category": "family-brunch", "query": "outdoor family brunch low crowd stroller", "expectIncludes": "Maple Yard", "expectNotTop": "Tiny Counter" },
+    { "kind": "ask", "category": "ambient-avoidance", "question": "do I avoid crowded places?", "expectLikely": true },
+    { "kind": "belief", "category": "avoidance", "predicate": "avoids", "object": "loud" },
+    { "kind": "belief", "category": "avoidance", "predicate": "avoids", "object": "crowded" },
+    { "kind": "recall", "category": "multilingual-study", "query": "quiet study room near metro", "expectTop": "Jing'an Study Room", "expectNotTop": "Nanjing Arcade" },
+    { "kind": "conversation", "category": "multilingual-grounding", "query": "low-noise tables metro", "expectIncludes": "Jing'an Study Room" },
+    { "kind": "recall", "category": "business-client", "query": "quiet professional client meeting vegetarian transit", "expectTop": "Cedar Table", "expectNotTop": "Tapas Barrel" },
+    { "kind": "persona", "category": "assistant-context", "query": "quiet professional client meeting vegetarian", "expectSystemIncludes": ["Avoids", "loud"], "expectPrependIncludes": ["Cedar Table"] },
+    { "kind": "scenario", "category": "business-scenario", "expectPlace": "Cedar Table", "expectOtherPlace": "Tapas Barrel", "expectIntent": "business", "expectConceptsInclude": ["quiet", "vegetarian", "transit", "loud"], "expectSummaryIncludes": ["preferred Cedar Table", "avoided Tapas Barrel"], "minTurns": 3 },
+    { "kind": "routine", "category": "family-routine", "expectPositivePlace": "Park Garden Cafe", "expectNegativePlace": "Mall Food Court", "expectIntentsInclude": ["family"], "expectConceptsInclude": ["outdoor", "quiet", "low_crowd"], "expectTitleIncludes": ["family"], "expectSummaryIncludes": ["preferred", "avoided"], "minScenarios": 2, "minConfidence": 0.7 },
+    { "kind": "graph", "category": "symbolic-memory", "expectIncludes": ["graph LR", "avoids", "loud", "Tapas Barrel"] },
+    { "kind": "belief", "category": "region", "predicate": "frequents", "object": "Madrid" }
+  ]
+}

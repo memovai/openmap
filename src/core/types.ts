@@ -103,6 +103,15 @@ export interface OmEvent {
   createdAt: string;
 }
 
+// ---- provenance -----------------------------------------------------------
+export type ProvenanceKind = "turn" | "event" | "memory" | "place" | "scenario" | "stated" | "import";
+export interface ProvenanceRef {
+  kind: ProvenanceKind;
+  id: string | number | null;
+  label?: string;
+  snippet?: string;
+}
+
 // ---- L2: beliefs (personal knowledge graph edges) -------------------------
 export const PREDICATES = [
   "likes",
@@ -128,6 +137,7 @@ export interface Belief {
   otype: ObjectType;
   confidence: number; // 0..1
   support: string[]; // provenance: event/memory refs
+  provenance?: ProvenanceRef[]; // structured provenance for replay/audit
   source: BeliefSource;
   updatedAt: string;
 }
@@ -144,6 +154,50 @@ export interface Memory {
   occurredAt: string | null;
   createdAt: string;
   source: string;
+  sourceRefs?: ProvenanceRef[];
+}
+
+// ---- L2 scenario: one captured episode grouping turns + map memories ------
+export interface Scenario {
+  id: number | null;
+  userId: string;
+  title: string;
+  summary: string;
+  turnIds: number[];
+  placeIds: string[];
+  concepts: string[];
+  intents: string[];
+  startedAt: string | null;
+  endedAt: string | null;
+  createdAt: string;
+}
+
+// ---- L2/L3 bridge: derived routines across repeated scenarios -------------
+export interface Routine {
+  id: string;
+  userId: string;
+  title: string;
+  summary: string;
+  scenarioIds: number[];
+  placeIds: string[];
+  positivePlaceIds: string[];
+  negativePlaceIds: string[];
+  concepts: string[];
+  intents: string[];
+  support: number;
+  confidence: number;
+  startedAt: string | null;
+  endedAt: string | null;
+  updatedAt: string;
+}
+
+// ---- place aliases (per-user canonicalization) ----------------------------
+export interface PlaceAlias {
+  userId: string;
+  alias: string;
+  normalized: string;
+  placeId: string;
+  createdAt: string;
 }
 
 // ---- L3: persona ----------------------------------------------------------
@@ -189,6 +243,9 @@ export interface IntentConstraints {
   maxBudget?: "low" | "mid" | "high" | null;
   dietary?: string[];
   walkable?: boolean;
+  noise?: "quiet" | "moderate" | "loud" | null;
+  crowd?: "low" | "moderate" | "high" | null;
+  travelMode?: "walk" | "transit" | "drive" | null;
 }
 
 /** A maps query is rarely literal ("romantic coffee shop" → a date). The frame

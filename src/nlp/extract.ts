@@ -87,9 +87,16 @@ const CONCEPT_LEXICON: Record<string, string[]> = {
   dessert: ["dessert", "cake", "bakery", "pastry", "ice cream", "gelato"],
   bbq: ["bbq", "barbecue", "grill"],
   vegetarian: ["vegetarian", "vegan", "plant-based"],
+  open_late: ["open late", "late-night", "late night", "open now", "24/7", "after midnight"],
+  walkable: ["walkable", "walk", "walking distance", "on foot"],
+  low_crowd: ["uncrowded", "not crowded", "not busy", "no crowds", "no crowd", "no line", "no queue"],
+  crowded: ["crowded", "busy", "packed", "crowd", "crowds", "line", "queue"],
+  transit: ["transit", "station", "subway", "metro", "train", "bus"],
+  parking: ["parking", "drive", "driving", "car", "valet"],
   // vibe concepts
   cozy: ["cozy", "cosy", "intimate", "snug"],
-  quiet: ["quiet", "calm", "peaceful"],
+  quiet: ["quiet", "calm", "peaceful", "low noise", "low-noise"],
+  loud: ["loud", "noisy", "noise", "too noisy", "loud music"],
   romantic: ["romantic", "candlelit"],
   lively: ["lively", "bustling", "vibrant"],
   outdoor: ["outdoor", "patio", "terrace", "rooftop", "garden seating"],
@@ -117,6 +124,34 @@ const TAG_TO_CONCEPT: Record<string, string> = {
   ramen: "ramen",
   sushi: "sushi",
   pizza: "pizza",
+  cozy: "cozy",
+  quiet: "quiet",
+  calm: "quiet",
+  loud: "loud",
+  noisy: "loud",
+  romantic: "romantic",
+  lively: "lively",
+  outdoor: "outdoor",
+  patio: "outdoor",
+  terrace: "outdoor",
+  vegan: "vegetarian",
+  vegetarian: "vegetarian",
+  plant_based: "vegetarian",
+  open_late: "open_late",
+  late_night: "open_late",
+  walkable: "walkable",
+  low_crowd: "low_crowd",
+  uncrowded: "low_crowd",
+  crowded: "crowded",
+  busy: "crowded",
+  transit: "transit",
+  station: "transit",
+  subway: "transit",
+  metro: "transit",
+  train: "transit",
+  bus: "transit",
+  parking: "parking",
+  valet: "parking",
 };
 
 export function conceptsFromTags(tags: string[]): string[] {
@@ -132,8 +167,10 @@ export function extractConcepts(text: string): string[] {
   const lower = text.toLowerCase();
   const words = new Set(lower.match(WORD) ?? []);
   const found: string[] = [];
+  const quietNoisePhrase = /\b(?:low[- ]noise|not noisy|not loud|not too noisy|not too loud|without noise|no loud music)\b/.test(lower);
   for (const [concept, triggers] of Object.entries(CONCEPT_LEXICON)) {
-    const hit = triggers.some((t) => (t.includes(" ") ? lower.includes(t) : words.has(t)));
+    if (concept === "loud" && quietNoisePhrase) continue;
+    const hit = triggers.some((t) => (/[ -]/.test(t) ? lower.includes(t) : words.has(t)));
     if (hit) found.push(concept);
   }
   return found;
@@ -146,7 +183,7 @@ const INTENT_LEXICON: Record<string, string[]> = {
   date: ["romantic", "intimate", "candlelit", "date", "date night", "couple"],
   romance: ["romantic", "anniversary", "candlelit"],
   work: ["work", "laptop", "wifi", "wi-fi", "remote", "co-working", "coworking"],
-  study: ["study", "studying", "quiet", "library"],
+  study: ["study", "studying", "library"],
   family: ["family", "kid", "kids", "children", "child-friendly", "family-friendly"],
   celebration: ["birthday", "celebrate", "celebration", "party", "anniversary"],
   business: ["business", "client", "meeting", "professional"],
@@ -160,7 +197,7 @@ export interface ScoredIntent {
 }
 
 /** Which extracted concepts are "vibe/affordance" (how it feels) vs category. */
-export const VIBE_CONCEPTS = new Set(["cozy", "quiet", "romantic", "lively", "outdoor", "cheap", "fancy"]);
+export const VIBE_CONCEPTS = new Set(["cozy", "quiet", "loud", "romantic", "lively", "outdoor", "cheap", "fancy"]);
 
 const COMPANION_PATTERNS: Array<[RegExp, string]> = [
   [/\b(kids?|children|child|toddler)\b/i, "kids"],
@@ -198,19 +235,67 @@ export interface Measure {
   value: number;
 }
 
-/** Pull numeric measures (distance/walk-time/spend) from a turn so an accepted
+/** Pull numeric measures (distance/walk-time/spend/ambient/travel friction) from a turn so an accepted
  * option teaches the calibration layer (e.g. agent says "3km away", user picks
  * it → learn near=3). Key-free; the LLM path can do this more robustly. */
 export function extractMeasures(text: string): Measure[] {
   const out: Measure[] = [];
-  for (const m of text.matchAll(/(\d+(?:\.\d+)?)\s*km\b/gi)) out.push({ term: "near", value: Number(m[1]) });
-  for (const m of text.matchAll(/(\d+(?:\.\d+)?)\s*m(?:eters)?\b/gi)) out.push({ term: "near", value: Number(m[1]) / 1000 });
+  const hasTerm = (term: string) => out.some((m) => m.term === term);
+  const add = (term: string, value: number) => {
+    if (Number.isFinite(value)) out.push({ term, value });
+  };
+  const addIfMissing = (term: string, value: number) => {
+    if (!hasTerm(term)) add(term, value);
+  };
+  for (const m of text.matchAll(/(\d+(?:\.\d+)?)\s*km\b/gi)) add("near", Number(m[1]));
+  for (const m of text.matchAll(/(\d+(?:\.\d+)?)\s*m(?:eters)?\b/gi)) add("near", Number(m[1]) / 1000);
   if (/\bwalk|on foot|步行/i.test(text))
     for (const m of text.matchAll(/(\d+(?:\.\d+)?)\s*(?:min|mins|minute|minutes)\b/gi))
-      out.push({ term: "walk_time", value: Number(m[1]) });
-  for (const m of text.matchAll(/[$¥€£]\s*(\d+(?:\.\d+)?)/g)) out.push({ term: "budget", value: Number(m[1]) });
+      add("walk_time", Number(m[1]));
+  for (const m of text.matchAll(/[$¥€£]\s*(\d+(?:\.\d+)?)/g)) add("budget", Number(m[1]));
   for (const m of text.matchAll(/(\d+(?:\.\d+)?)\s*(?:yen|usd|dollars?|rmb|元|块)\b/gi))
-    out.push({ term: "budget", value: Number(m[1]) });
+    add("budget", Number(m[1]));
+
+  const lower = text.toLowerCase();
+  for (const m of lower.matchAll(/(?:noise|sound|ambient)\s*(?:level|score|rating)?\s*(?:is|=|:)?\s*(\d+(?:\.\d+)?)\s*(?:\/\s*10|out of 10)\b/g))
+    add("noise", Math.min(1, Number(m[1]) / 10));
+  for (const m of lower.matchAll(/\b(\d+(?:\.\d+)?)\s*(?:\/\s*10|out of 10)\s*(?:noise|sound|ambient)\b/g))
+    add("noise", Math.min(1, Number(m[1]) / 10));
+  for (const m of lower.matchAll(/\b(\d+(?:\.\d+)?)\s*db\b/g))
+    add("noise", Math.max(0, Math.min(1, (Number(m[1]) - 35) / 50)));
+  if (!hasTerm("noise")) {
+    if (/\b(?:quiet|calm|peaceful|low[- ]noise|not noisy|not loud|not too noisy|not too loud|without noise|no loud music)\b/.test(lower))
+      add("noise", 0.2);
+    else if (/\b(?:moderate noise|some noise|background noise)\b/.test(lower))
+      add("noise", 0.5);
+    else if (/\b(?:loud|noisy|too noisy|loud music|deafening)\b/.test(lower))
+      add("noise", 0.85);
+  }
+
+  for (const m of lower.matchAll(/(?:crowd|busy|busyness)\s*(?:level|score|rating)?\s*(?:is|=|:)?\s*(\d+(?:\.\d+)?)\s*(?:\/\s*10|out of 10)\b/g))
+    add("crowd", Math.min(1, Number(m[1]) / 10));
+  for (const m of lower.matchAll(/\b(\d+(?:\.\d+)?)\s*(?:\/\s*10|out of 10)\s*(?:crowd|busy|busyness)\b/g))
+    add("crowd", Math.min(1, Number(m[1]) / 10));
+  if (!hasTerm("crowd")) {
+    if (/\b(?:uncrowded|not crowded|not busy|not too crowded|not too busy|without crowds?|no crowds?|no line|no queue)\b/.test(lower))
+      add("crowd", 0.2);
+    else if (/\b(?:moderately crowded|some crowd|some line|some queue)\b/.test(lower))
+      add("crowd", 0.5);
+    else if (/\b(?:crowded|busy|packed|crowds?|long line|long queue)\b/.test(lower))
+      add("crowd", 0.85);
+  }
+
+  const transit = "(?:station|subway|metro|train|bus|transit)";
+  for (const m of lower.matchAll(new RegExp(`(\\d+(?:\\.\\d+)?)\\s*(?:min|mins|minute|minutes)\\s*(?:walk\\s*)?(?:from|to|away from|to the|from the)\\s+(?:the\\s+)?${transit}\\b`, "g")))
+    add("transit_walk", Number(m[1]));
+  for (const m of lower.matchAll(new RegExp(`${transit}\\s*(?:is\\s*)?(\\d+(?:\\.\\d+)?)\\s*(?:min|mins|minute|minutes)\\s*(?:walk|away)\\b`, "g")))
+    add("transit_walk", Number(m[1]));
+  if (!hasTerm("transit_walk")) {
+    if (new RegExp(`\\b(?:next to|beside|attached to|inside|at)\\s+(?:the\\s+)?${transit}\\b`).test(lower))
+      add("transit_walk", 2);
+    else if (new RegExp(`\\b(?:near|close to|by)\\s+(?:the\\s+)?${transit}\\b`).test(lower))
+      add("transit_walk", 5);
+  }
   return out;
 }
 

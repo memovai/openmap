@@ -7,15 +7,24 @@ process.on("warning", (w) => {
 
 import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
-import { dirname, join } from "node:path";
+import { dirname, isAbsolute, join } from "node:path";
 import { buildOpenMap } from "../src/openmap.js";
 import { loadConfig } from "../src/core/config.js";
 import { runEval, type EvalDataset } from "./harness.js";
 
 const here = dirname(fileURLToPath(import.meta.url));
 
+function argValue(name: string, fallback: string): string {
+  return process.argv.find((a) => a.startsWith(`${name}=`))?.slice(name.length + 1) ?? fallback;
+}
+
+function resolveDatasetPath(path: string): string {
+  return isAbsolute(path) ? path : join(here, path);
+}
+
 async function main() {
-  const dataset = JSON.parse(await readFile(join(here, "dataset.json"), "utf-8")) as EvalDataset;
+  const datasetPath = resolveDatasetPath(argValue("--dataset", "dataset.json"));
+  const dataset = JSON.parse(await readFile(datasetPath, "utf-8")) as EvalDataset;
   const cfg = { ...loadConfig(), dbPath: ":memory:" };
   const mem = buildOpenMap(cfg);
   const llmAvailable = Boolean(cfg.openaiApiKey);
