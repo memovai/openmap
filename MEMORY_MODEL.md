@@ -49,6 +49,12 @@ places, compute a saturating confidence with provenance, and consolidate up.
 the literal words) over remembered places, ranked by taste prior + matching
 affordances + proximity (using the learned near-radius).
 
+**"Coffee near me" through a live map provider** — build a memory-informed
+search plan first (`quiet`, `low_crowd`, `work`, avoid `loud` if the user's
+history supports that), let the host agent fetch live POIs, then rerank those
+candidates. Live candidates are not stored until the user actually chooses,
+rejects, or discusses them and `capture()` observes that feedback.
+
 **Auto-calibration (revealed preference)** — when `observe` sees the agent offer
 options with distances/prices and the user accept one, it learns the accepted
 measure: picked a place 3 km away → `near ≥ 3 km`; rejections ("too far") are
@@ -77,6 +83,6 @@ store/  db.ts (SQLite + sqlite-vec, migrations, aliases)
 nlp/    embedding · extract · tagger
 memory/ inference · taste · persona · anchors · regions · calibration · graph · scenarios
 world/  affordance · relations
-search/ recall · ranking
+search/ planning · candidate rerank · recall · ranking
 openmap.ts (facade) · cli.ts · mcp.ts · index.ts
 ```

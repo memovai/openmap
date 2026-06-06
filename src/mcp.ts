@@ -1,4 +1,4 @@
-// MCP server exposing openmap as agent tools. Run: `openmap serve-mcp`.
+// MCP server exposing openmap as agent tools. Run: `openmap serve`.
 process.removeAllListeners("warning");
 process.on("warning", (w) => {
   if (w.name === "ExperimentalWarning" && /SQLite/i.test(w.message)) return;
@@ -16,6 +16,19 @@ const scored = (items: ScoredPlace[]) =>
   items.map((s) => ({ ...placeBrief(s.place), score: s.score, distanceKm: s.distanceKm, relationship: s.relationship, reasons: s.reasons }));
 const near = (lat?: number, lng?: number) => (lat != null && lng != null ? { lat, lng } : null);
 const asText = (obj: unknown) => ({ content: [{ type: "text" as const, text: JSON.stringify(obj, null, 2) }] });
+const candidateSchema = z
+  .object({
+    name: z.string(),
+    lat: z.number().nullable().optional(),
+    lng: z.number().nullable().optional(),
+    category: z.string().nullable().optional(),
+    address: z.string().nullable().optional(),
+    source: z.string().optional(),
+    sourceId: z.string().nullable().optional(),
+    tags: z.array(z.string()).optional(),
+    raw: z.record(z.unknown()).optional(),
+  })
+  .passthrough();
 
 export async function main(): Promise<void> {
   let McpServer: any, StdioServerTransport: any;
@@ -29,6 +42,27 @@ export async function main(): Promise<void> {
 
   const mem = buildOpenMap();
   const server = new McpServer({ name: "openmap", version: "0.3.0" });
+
+  server.tool(
+    "local_search_context",
+    "Before calling a live map/place search, turn the user's query into memory-informed search hints: expanded search query, include/avoid terms, learned constraints, and location radius. OpenMap does not fetch POIs.",
+    { query: z.string(), lat: z.number().optional(), lng: z.number().optional(), userId: z.string().optional() },
+    async (a: any) => asText(await mem.planPlaceSearch(a.query, { near: near(a.lat, a.lng), userId: a.userId })),
+  );
+
+  server.tool(
+    "rerank_places",
+    "After a live map/place search returns candidates, personalize and rerank those POIs using the user's place memory, preferences, learned constraints, and prior liked/disliked places. Does not store candidates.",
+    {
+      query: z.string(),
+      candidates: z.array(candidateSchema),
+      lat: z.number().optional(),
+      lng: z.number().optional(),
+      limit: z.number().optional(),
+      userId: z.string().optional(),
+    },
+    async (a: any) => asText(await mem.rankCandidatePlaces(a.query, a.candidates, { near: near(a.lat, a.lng), limit: a.limit ?? 10, userId: a.userId })),
+  );
 
   server.tool(
     "remember",

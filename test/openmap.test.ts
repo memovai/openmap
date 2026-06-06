@@ -208,6 +208,46 @@ test("derived symbolic beliefs directly steer recall ranking", async () => {
   assert.ok((loud.reasons.symbolicBonus as number) < 1);
 });
 
+test("place search plan turns broad live-search queries into memory-informed hints", async () => {
+  const mem = makeMemory();
+  await mem.rememberPlace(raw("Quiet Beans", 37.776, -122.42, ["coffee", "quiet", "work", "low_crowd"]), { userId: "u", relationship: "loved" });
+  await mem.rememberPlace(raw("Roar Cafe", 37.775, -122.419, ["coffee", "loud", "crowded"]), { userId: "u", relationship: "disliked" });
+
+  const plan = await mem.planPlaceSearch("coffee near me", { userId: "u", near: { lat: 37.775, lng: -122.419 } });
+  assert.match(plan.searchQuery, /quiet/);
+  assert.ok(plan.include.includes("work"));
+  assert.ok(plan.include.includes("low_crowd"));
+  assert.ok(plan.avoid.includes("loud"));
+  assert.ok(plan.avoid.includes("crowded"));
+  assert.ok(!plan.avoid.includes("coffee"));
+  assert.equal(plan.constraints.noise, "quiet");
+  assert.equal(plan.constraints.crowd, "low");
+});
+
+test("candidate reranking personalizes live map results without storing them", async () => {
+  const mem = makeMemory();
+  await mem.rememberPlace(raw("Quiet Beans", 37.776, -122.42, ["coffee", "quiet", "work", "low_crowd"]), { userId: "u", relationship: "loved" });
+  await mem.rememberPlace(raw("Roar Cafe", 37.775, -122.419, ["coffee", "loud", "crowded"]), { userId: "u", relationship: "disliked" });
+
+  const before = mem.listPlaces("u").length;
+  const ranked = await mem.rankCandidatePlaces(
+    "coffee near me",
+    [
+      raw("Closest Loud Coffee", 37.775, -122.419, ["coffee", "loud", "crowded"]),
+      raw("Calm Work Cafe", 37.782, -122.428, ["coffee", "quiet", "work", "low_crowd"]),
+      raw("Roar Cafe", 37.775, -122.419, ["coffee", "loud", "crowded"]),
+    ],
+    { userId: "u", near: { lat: 37.775, lng: -122.419 }, limit: 3 },
+  );
+
+  assert.equal(ranked.results[0]!.place.name, "Calm Work Cafe");
+  const knownBad = ranked.results.find((r) => r.place.name === "Roar Cafe")!;
+  assert.equal(knownBad.memory.matched, true);
+  assert.equal(knownBad.memory.relationship, "disliked");
+  assert.match(String(knownBad.reasons.constraintMisses), /noise:quiet/);
+  assert.equal(mem.listPlaces("u").length, before, "live candidates should not be persisted");
+});
+
 test("recall on empty memory is safe", async () => {
   assert.deepEqual(await makeMemory().recall("anything"), []);
 });

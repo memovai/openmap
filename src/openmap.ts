@@ -23,6 +23,13 @@ import { type Calibration, allCalibrations, learnCalibration } from "./memory/ca
 import { buildGraph, graphToMermaid, type KnowledgeGraph } from "./memory/graph.js";
 import { type RankingBeliefSignals } from "./search/ranking.js";
 import { recallPlaces } from "./search/recall.js";
+import {
+  buildPlaceSearchPlan,
+  rankCandidatePlaces,
+  type CandidatePlaceInput,
+  type CandidateRankingResult,
+  type PlaceSearchPlan,
+} from "./search/assist.js";
 import { formatPersonaContext, formatRecallBlock, type RecallBlockSource } from "./memory/hooks.js";
 import { type RelatedPlace, relatedPlaces as relatedPlacesOf } from "./world/relations.js";
 import { ALLOWED_GOALS } from "./prompts/intent.js";
@@ -106,6 +113,7 @@ export interface RecallContext {
   sources: Record<string, RecallSource[]>;
 }
 export type RecallSource = RecallBlockSource;
+export type { CandidatePlaceInput, CandidateRankingResult, PlaceSearchPlan };
 
 const ACCEPTING = new Set<Relationship>(["visited", "loved", "liked", "want_to_go"]);
 const REJECTION_RE = /too far|too expensive|too pricey|too long|not worth|too much|skip it/i;
@@ -418,6 +426,51 @@ export class OpenMap {
       concepts: [...new Set([...frame.concepts, ...frame.vibe])], intents: frame.goals,
     });
     return places;
+  }
+
+  /**
+   * Build a memory-informed plan for a host map/search tool. OpenMap does not
+   * fetch live POIs; it tells the host what to search for and which user-specific
+   * constraints/preferences should shape that search.
+   */
+  async planPlaceSearch(query: string, opts: { near?: GeoPoint | null; userId?: string } = {}): Promise<PlaceSearchPlan> {
+    const userId = opts.userId ?? DEFAULT_USER;
+    const plan = await buildPlaceSearchPlan({ db: this.db, tagger: this.tagger, userId, query, near: opts.near ?? null });
+    this.logSearchFrame(userId, query, plan.frame);
+    return plan;
+  }
+
+  /**
+   * Personalize live POI candidates returned by a host map provider. Candidates
+   * are ranked in memory, but not stored as long-term places unless the user
+   * later talks about or chooses them and `capture()` observes that feedback.
+   */
+  async rankCandidatePlaces(
+    query: string,
+    candidates: CandidatePlaceInput[],
+    opts: { near?: GeoPoint | null; limit?: number; userId?: string; log?: boolean } = {},
+  ): Promise<CandidateRankingResult> {
+    const userId = opts.userId ?? DEFAULT_USER;
+    const result = await rankCandidatePlaces({
+      db: this.db,
+      embedder: this.embedder,
+      tagger: this.tagger,
+      userId,
+      query,
+      near: opts.near ?? null,
+      candidates,
+      limit: opts.limit ?? 10,
+      beliefSignals: this.rankingBeliefSignals(userId),
+    });
+    if (opts.log !== false) this.logSearchFrame(userId, query, result.plan.frame);
+    return result;
+  }
+
+  private logSearchFrame(userId: string, query: string, frame: IntentFrame): void {
+    this.logEvent({
+      userId, kind: "search", text: query, placeId: null,
+      concepts: [...new Set([...frame.concepts, ...frame.vibe])], intents: frame.goals,
+    });
   }
 
   private rankingBeliefSignals(userId: string): RankingBeliefSignals {

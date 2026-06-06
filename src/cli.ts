@@ -9,7 +9,8 @@ process.on("warning", (w) => {
 import { readFile } from "node:fs/promises";
 import { Command } from "commander";
 import { loadConfig, resolvedEmbedder, resolvedTagger } from "./core/config.js";
-import type { ConversationTurn } from "./openmap.js";
+import type { CandidatePlaceInput, ConversationTurn } from "./openmap.js";
+import type { RankedCandidatePlace } from "./search/assist.js";
 import {
   type GeoPoint,
   type Place,
@@ -38,6 +39,12 @@ async function readTurns(file: string): Promise<ConversationTurn[]> {
   return turns as ConversationTurn[];
 }
 
+async function readCandidates(file: string): Promise<CandidatePlaceInput[]> {
+  const candidates = JSON.parse(await readFile(file, "utf-8"));
+  if (!Array.isArray(candidates)) throw new Error(`invalid candidates file '${file}', expected an array`);
+  return candidates as CandidatePlaceInput[];
+}
+
 const placeBrief = (p: Place) => ({
   name: p.name, placeId: p.id, category: p.category, address: p.address,
   lat: p.lat, lng: p.lng, tags: p.tags,
@@ -51,6 +58,8 @@ const scored = (items: ScoredPlace[]) =>
     source: s.place.source,
     reasons: s.reasons,
   }));
+const rankedCandidates = (items: RankedCandidatePlace[]) =>
+  items.map((s) => ({ ...scored([s])[0], inputIndex: s.inputIndex, memory: s.memory }));
 
 const program = new Command();
 program
@@ -62,6 +71,8 @@ program
 Agent loop:
   openmap context "$USER_MESSAGE"      # before answering
   openmap observe transcript.json      # after the exchange
+  openmap plan "coffee near me"        # before live map search
+  openmap rerank "coffee near me" candidates.json
 
 Manual overrides and inspection live under:
   openmap manual --help
@@ -108,6 +119,19 @@ async function searchAction(query: string, o: AnyOptions) {
 async function contextAction(query: string, o: AnyOptions) {
   const ctx = await (await openMap()).recallContext(query, { near: parseNear(o.near), limit: Number(o.limit ?? 5), userId: user() });
   emit({ query, system: ctx.system, prepend: ctx.prepend, places: scored(ctx.places), sources: ctx.sources });
+}
+
+async function planAction(query: string, o: AnyOptions) {
+  emit(await (await openMap()).planPlaceSearch(query, { near: parseNear(o.near), userId: user() }));
+}
+
+async function rerankAction(query: string, file: string, o: AnyOptions) {
+  const out = await (await openMap()).rankCandidatePlaces(query, await readCandidates(file), {
+    near: parseNear(o.near),
+    limit: Number(o.limit ?? 10),
+    userId: user(),
+  });
+  emit({ query, plan: out.plan, results: rankedCandidates(out.results) });
 }
 
 async function evidenceAction(query: string, o: AnyOptions) {
@@ -231,6 +255,21 @@ function addSearchCommand(parent: Command, name: string, hidden = false) {
     .option("--near <lat,lng>")
     .option("-l, --limit <n>", "max results", "5")
     .action(searchAction);
+}
+
+function addPlanCommand(parent: Command, name: string, hidden = false) {
+  cmd(parent, `${name} <query>`, hidden)
+    .description("Build memory-informed hints for a live map/place search.")
+    .option("--near <lat,lng>")
+    .action(planAction);
+}
+
+function addRerankCommand(parent: Command, name: string, hidden = false) {
+  cmd(parent, `${name} <query> <candidates.json>`, hidden)
+    .description("Personalize live place candidates from a host map provider.")
+    .option("--near <lat,lng>")
+    .option("-l, --limit <n>", "max results", "10")
+    .action(rerankAction);
 }
 
 function addEvidenceCommand(parent: Command, name: string, hidden = false) {
@@ -448,6 +487,8 @@ function addManualCommands(parent: Command) {
 // ---- primary CLI -----------------------------------------------------------
 addObserveCommand(program, "observe");
 addContextCommand(program, "context");
+addPlanCommand(program, "plan");
+addRerankCommand(program, "rerank");
 addSearchCommand(program, "search");
 addEvidenceCommand(program, "evidence");
 

@@ -6,9 +6,11 @@ agent's conversation is the only input; there is no POI/map-data acquisition.
 ## Thesis
 
 A personal, geo-anchored **taste + spatial** memory, built entirely from
-conversation. `recall` resolves a (usually non-literal) maps query into an intent
-frame and ranks the user's *remembered* places by intent × taste × affordances ×
-proximity. Two things make it map-aware and personal:
+conversation. OpenMap has two read paths: `recall` ranks the user's *remembered*
+places, while `planPlaceSearch` + `rankCandidatePlaces` help a host agent
+personalize *live* map-search candidates. Both resolve a usually non-literal maps
+query into an intent frame and apply taste × affordances × proximity. Two things
+make it map-aware and personal:
 
 1. a **knowledge graph** of beliefs distilled from behavior (likes/avoids/
    lives_near/pursues), and
@@ -20,7 +22,7 @@ proximity. Two things make it map-aware and personal:
 ```
 ┌ interface ── cli.ts · mcp.ts  (JSON-first, agent-consumable)
 ├ facade ───── openmap.ts  (OpenMap: orchestrates; logic lives below)
-├ search ───── recall.ts · ranking.ts  (hybrid recall pipeline + rankMemory)
+├ search ───── assist.ts · recall.ts · ranking.ts  (search planning, candidate rerank, recall)
 ├ memory ───── inference (beliefs + reconcile ADD/UPDATE/NOOP + recency decay)
 │              taste · persona · anchors · regions · calibration · graph · scenarios
 ├ nlp ──────── embedding · extract (mentions/concepts/intent/measures) · tagger (IntentFrame)
@@ -61,6 +63,23 @@ personas / collections / collection_items / scenarios
 (affect-weighted centroid of loved places, blended with the persona). Beliefs are
 the relationship layer; calibrations are the spatial/preference self-model.
 
+## Live Search Assist
+
+OpenMap intentionally does **not** fetch POIs. A host agent such as OpenClaw does:
+
+```
+user query
+  → planPlaceSearch(query)        -- memory-informed search hints
+  → host map provider             -- OpenStreetMap / Google / internal POI API
+  → rankCandidatePlaces(query, candidates)
+  → capture(final exchange)       -- learn from choice/rejection
+```
+
+`planPlaceSearch()` returns a search query, include/avoid terms, learned constraints
+and location radius. `rankCandidatePlaces()` receives host-provided candidates and
+reranks them without persisting them. If a candidate matches an existing alias or
+remembered place, its loved/disliked relationship feeds the score.
+
 ## Ranking (auditable; every result carries `reasons`)
 
 ```
@@ -70,10 +89,11 @@ score = ( W_QUERY·sim(frame, place) + W_AFFECT·affect + W_TASTE·sim(taste, pl
 ```
 
 `geoAffinity` uses the user's **learned** near-radius (no hardcoded distance).
-`recall` resolves the frame (vibe + goals + concepts), defaults an unanchored query
-to the user's anchor (home → most-active area), and logs the query as a behavioral
-event — so searching is itself learning. Derived symbolic beliefs (`likes`,
-`avoids`, `pursues`) now directly affect ranking, not only the exported graph.
+`recall` and candidate reranking resolve the frame (vibe + goals + concepts),
+default an unanchored query to the user's anchor (home → most-active area), and log
+the query as a behavioral event — so searching is itself learning. Derived
+symbolic beliefs (`likes`, `avoids`, `pursues`) directly affect ranking, not only
+the exported graph.
 
 ## Two geo layers, linked
 
@@ -89,6 +109,7 @@ event — so searching is itself learning. Derived symbolic beliefs (`likes`,
 |----------|-------|
 | Add a learnable fuzzy term | `memory/calibration.ts` `TERMS` (one entry) |
 | Better extraction (mentions/measures/relationship) | `nlp/extract.ts` / `nlp/tagger.ts` (LLM path) |
+| Personalize live POI search | `search/assist.ts` (`planPlaceSearch`, `rankCandidatePlaces`) |
 | Scale beyond local | `store/db.ts` (vec0 already; add sharding) |
 | New ingestion | feed `observe()` more turns; add importers |
 

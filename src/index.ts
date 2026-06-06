@@ -18,6 +18,9 @@ export type {
   CaptureResult,
   RecallContext,
   RecallSource,
+  CandidatePlaceInput,
+  CandidateRankingResult,
+  PlaceSearchPlan,
 } from "./openmap.js";
 export { formatPersonaContext, formatRecallBlock } from "./memory/hooks.js";
 export type { RecallBlockSource, RecallBlockSources } from "./memory/hooks.js";
@@ -69,6 +72,13 @@ export { rankMemory } from "./search/ranking.js";
 export type { RankingBeliefSignals, WeightedBeliefTerm } from "./search/ranking.js";
 export { recallPlaces } from "./search/recall.js";
 export type { RecallPipelineArgs, RecallPipelineResult } from "./search/recall.js";
+export { buildPlaceSearchPlan, rankCandidatePlaces } from "./search/assist.js";
+export type {
+  SearchAssistArgs,
+  CandidateRankingArgs,
+  CandidateMemoryMatch,
+  RankedCandidatePlace,
+} from "./search/assist.js";
 
 export { haversineKm, geoBonus, geoGate, geoAffinity } from "./core/geo.js";
 

@@ -7,7 +7,7 @@ and answers from that memory. It does **not** fetch map/POI data (that's the hos
 agent's job); openmap is the memory, not the maps API.
 
 ```
-   conversation ──▶ extract ──▶ [ per-user memory graph ] ──▶ recall · ask · persona
+   conversation ──▶ extract ──▶ [ per-user memory graph ] ──▶ plan · rerank · recall
    (the only input)   places/         events → beliefs            (taste + intent
                       attrs/intent     + calibrations               + learned "near")
 ```
@@ -24,6 +24,10 @@ agent's job); openmap is the memory, not the maps API.
 - **Resolves latent intent** — a maps query is rarely literal; `recall` turns "a
   cozy date spot" into a frame {goals, companions, vibe, constraints} and ranks the
   user's remembered places by intent × taste × affordances × proximity.
+- **Personalizes live place search** — OpenMap does not fetch POIs, but it does
+  produce memory-informed search hints before the host calls a map API, then
+  reranks the returned candidates by user taste, constraints, prior likes/dislikes,
+  and learned spatial vocabulary.
 - **Learns the user's spatial vocabulary** — what *near* means to them (e.g. 3 km),
   walk tolerance, typical spend — learned from accepted options, not hardcoded.
 - **Map-aware** — home/work anchors, frequented areas (user↔area), distance-aware
@@ -46,6 +50,10 @@ extraction). Set `OPENAI_API_KEY` to upgrade embeddings + LLM extraction/intent.
 # ── agent hooks: the two calls a host wires into its turn loop ──
 openmap -u alice context "a quiet spot to work"     # before answer → {system, prepend}
 openmap -u alice observe transcript.json           # after exchange → raw L0 + extracted memory
+
+# ── live map-search assist: host fetches POIs, openmap personalizes the flow ──
+openmap -u alice plan "coffee near me" --near 37.77,-122.42
+openmap -u alice rerank "coffee near me" candidates.json --near 37.77,-122.42
 
 # human/debug reads
 openmap -u alice search "a cozy quiet spot to work" # ranked remembered places
@@ -90,6 +98,18 @@ const { system, prepend } = await mem.recallContext(userMessage, { userId });
 await mem.capture([{ role: "user", content: userMessage }, { role: "assistant", content: reply }], { userId });
 ```
 
+For live local search, use the memory layer around the host's map provider:
+
+```ts
+// before calling OpenStreetMap/Google/etc.
+const plan = await mem.planPlaceSearch("coffee near me", { userId, near });
+// plan.searchQuery / plan.include / plan.avoid tell the host what to search for.
+
+const candidates = await hostMapSearch(plan.searchQuery, { near: plan.location });
+const ranked = await mem.rankCandidatePlaces("coffee near me", candidates, { userId, near });
+// ranked.results are live POIs, personalized but not persisted.
+```
+
 Raw turns are kept in an **L0 log** so the agent can recall original wording to ground a
 memory — `mem.searchConversation("the loud bar")` / the `conversation_search` MCP tool.
 `recallContext()` also returns `sources[placeId]` and includes `source turn#...` citations
@@ -107,8 +127,10 @@ npm install @modelcontextprotocol/sdk
 openmap serve
 ```
 
-Primary tools: `recall_context` (auto-recall), `capture` (auto-capture),
-`conversation_search` (raw evidence), `taste_profile`, `scenarios`, `routines`.
+Primary tools: `local_search_context` (pre-search hints), `rerank_places`
+(post-search candidate ranking), `recall_context` (auto-recall), `capture`
+(auto-capture), `conversation_search` (raw evidence), `taste_profile`,
+`scenarios`, `routines`.
 
 Advanced/manual tools are also exposed for tests and admin flows: `remember`,
 `observe`, `recall`, `resolve_intent`, `ask`, `consolidate`, `repair_contradictions`,
@@ -164,7 +186,7 @@ A thin `OpenMap` facade orchestrates focused modules — see
 
 ```
 core/    types · geo · config            store/   sqlite + sqlite-vec + migrations + aliases
-nlp/     embedding · extract · tagger     search/  recall pipeline · ranking
+nlp/     embedding · extract · tagger     search/  planning · candidate rerank · recall · ranking
 prompts/ intent · mentions · memory       world/   affordance(vibe) · relations(near/similar)
 memory/  inference(beliefs+reconcile+decay) · taste · anchors · regions
          · calibration(near/walk/noise/crowd/transit thresholds) · graph · persona
