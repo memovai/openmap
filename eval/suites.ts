@@ -156,7 +156,7 @@ export async function runEvalSuites(
 
   for (const spec of manifest.suites) {
     const dataset = await loadSuiteDataset(spec);
-    const mem = buildOpenMap(cfg);
+    const mem = buildOpenMap(cfg, { allowHeuristicFallbackForTests: !llmAvailable });
     const report = await runEval(dataset, mem, { llmAvailable });
     suites.push({
       id: spec.id,
@@ -189,7 +189,7 @@ export async function buildSuiteReplay(
 
   for (const spec of manifest.suites) {
     const dataset = await loadSuiteDataset(spec);
-    const mem = buildOpenMap(cfg);
+    const mem = buildOpenMap(cfg, { allowHeuristicFallbackForTests: !llmAvailable });
     const snapshot = await buildReplaySnapshot(dataset, mem, {
       llmAvailable,
       model: llmAvailable ? cfg.openaiChatModel : null,

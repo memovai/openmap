@@ -7,7 +7,7 @@ import { DatabaseSync } from "node:sqlite";
 
 import { DB, type RememberedRow } from "../src/store/db.js";
 import { type Embedder } from "../src/nlp/embedding.js";
-import { HeuristicExtractor, extractMeasures, type ScoredIntent } from "../src/nlp/extract.js";
+import { HeuristicExtractor, LLMExtractor, extractConcepts, extractMeasures, type ScoredIntent } from "../src/nlp/extract.js";
 import { LexiconTagger, type Tagger, lexiconFrame } from "../src/nlp/tagger.js";
 import { OpenMap, buildOpenMap } from "../src/openmap.js";
 import { loadConfig } from "../src/core/config.js";
@@ -208,20 +208,90 @@ test("derived symbolic beliefs directly steer recall ranking", async () => {
   assert.ok((loud.reasons.symbolicBonus as number) < 1);
 });
 
+test("symbolic likes only boost terms relevant to the current query", () => {
+  const place = (name: string, tags: string[]): Place => ({
+    id: name,
+    name,
+    lat: null,
+    lng: null,
+    category: null,
+    address: null,
+    source: "test",
+    sourceId: name,
+    tags,
+    raw: {},
+  });
+  const items: RememberedRow[] = [
+    { place: place("Cowork Library", ["quiet", "low_crowd", "transit", "study"]), embedding: null, aggAffect: 1, relationship: "loved" },
+    { place: place("Quiet Beans", ["coffee", "quiet"]), embedding: null, aggAffect: 1, relationship: "loved" },
+  ];
+  const frame: IntentFrame = {
+    rawQuery: "a quiet coffee spot",
+    goals: ["study"],
+    companions: null,
+    occasion: null,
+    concepts: ["coffee"],
+    vibe: ["quiet"],
+    constraints: { noise: "quiet" },
+  };
+  const res = rankMemory({
+    items,
+    relevance: new Map(items.map((it) => [it.place.id, 1])),
+    tasteSim: [0, 0],
+    prefs: emptyPrefs(),
+    beliefSignals: {
+      likes: [
+        { term: "quiet", confidence: 1 },
+        { term: "coffee", confidence: 1 },
+        { term: "low_crowd", confidence: 1 },
+        { term: "transit", confidence: 1 },
+        { term: "study", confidence: 1 },
+      ],
+      avoids: [],
+      pursues: [],
+    },
+    frame,
+    near: null,
+    nearRadiusKm: 3,
+    limit: 2,
+  });
+  assert.equal(res[0]!.place.name, "Quiet Beans");
+  assert.equal(res[0]!.reasons.symbolicLikes, "quiet,coffee");
+  assert.equal(res[1]!.reasons.symbolicLikes, "quiet");
+});
+
 test("place search plan turns broad live-search queries into memory-informed hints", async () => {
   const mem = makeMemory();
   await mem.rememberPlace(raw("Quiet Beans", 37.776, -122.42, ["coffee", "quiet", "work", "low_crowd"]), { userId: "u", relationship: "loved" });
   await mem.rememberPlace(raw("Roar Cafe", 37.775, -122.419, ["coffee", "loud", "crowded"]), { userId: "u", relationship: "disliked" });
+  mem.consolidate("u");
 
   const plan = await mem.planPlaceSearch("coffee near me", { userId: "u", near: { lat: 37.775, lng: -122.419 } });
   assert.match(plan.searchQuery, /quiet/);
-  assert.ok(plan.include.includes("work"));
   assert.ok(plan.include.includes("low_crowd"));
   assert.ok(plan.avoid.includes("loud"));
   assert.ok(plan.avoid.includes("crowded"));
+  assert.ok(!plan.include.includes("work"));
   assert.ok(!plan.avoid.includes("coffee"));
+  assert.ok(!mem.beliefs("u", { predicate: "avoids" }).some((b) => b.object === "coffee"));
   assert.equal(plan.constraints.noise, "quiet");
   assert.equal(plan.constraints.crowd, "low");
+});
+
+test("place search plan does not inject unrelated remembered categories or goals", async () => {
+  const mem = makeMemory();
+  await mem.rememberPlace(raw("Quiet Beans", 37.776, -122.42, ["coffee", "quiet", "work", "low_crowd"]), { userId: "u", relationship: "loved" });
+  await mem.rememberPlace(raw("Study Hall", 37.777, -122.421, ["study", "quiet", "transit"]), { userId: "u", relationship: "loved" });
+  await mem.rememberPlace(raw("Bella", 37.778, -122.422, ["date", "romantic"]), { userId: "u", relationship: "loved" });
+  mem.consolidate("u");
+
+  const plan = await mem.planPlaceSearch("date night dinner", { userId: "u" });
+  assert.ok(plan.include.includes("date"));
+  assert.ok(plan.include.includes("quiet"));
+  assert.ok(!plan.include.includes("coffee"));
+  assert.ok(!plan.include.includes("work"));
+  assert.ok(!plan.include.includes("study"));
+  assert.doesNotMatch(plan.searchQuery, /\bcoffee\b|\bwork\b|\bstudy\b/);
 });
 
 test("candidate reranking personalizes live map results without storing them", async () => {
@@ -620,6 +690,11 @@ test("extractMeasures derives ambient and transit-access calibration samples", (
   assert.ok(measures.some((m) => m.term === "transit_walk" && m.value === 2));
 });
 
+test("low-crowd phrases do not also extract crowded", () => {
+  assert.deepEqual(extractConcepts("quiet, uncrowded, and low crowd"), ["low_crowd", "quiet"]);
+  assert.ok(extractConcepts("too loud and crowded").includes("crowded"));
+});
+
 test("observe learns noise, crowd, and transit friction from accepted scoped context", async () => {
   const mem = makeMemory();
   const res = await mem.observe(
@@ -665,6 +740,24 @@ test("mention extraction ignores contraction apostrophes", async () => {
   assert.equal(mem.listMemories()[0]!.place!.name, "Ritual Coffee"); // not "s do"
 });
 
+test("key-free mention extraction is conservative for unquoted prose", async () => {
+  const ex = new HeuristicExtractor();
+  assert.deepEqual(await ex.extract("Pick Quiet Beans for work calls"), ["Quiet Beans"]);
+  assert.deepEqual(await ex.extract("8km is too far, skip it"), []);
+  assert.deepEqual(await ex.extract('pick "Quiet Beans" for work calls'), ["Quiet Beans"]);
+});
+
+test("LLM mention extraction sanitizes boilerplate and structured responses", async () => {
+  const none = new LLMExtractor({ async run() { return "No physical places mentioned."; } }, "test");
+  assert.deepEqual(await none.extract("The line was too long, so skip it."), []);
+
+  const json = new LLMExtractor({ async run() { return JSON.stringify({ places: [{ name: "Quiet Beans" }, { name: "None" }] }); } }, "test");
+  assert.deepEqual(await json.extract("Pick Quiet Beans for work calls"), ["Quiet Beans"]);
+
+  const numbered = new LLMExtractor({ async run() { return "1. Quiet Beans\n2. Roar Cafe"; } }, "test");
+  assert.deepEqual(await numbered.extract("Pick Quiet Beans, skip Roar Cafe"), ["Quiet Beans", "Roar Cafe"]);
+});
+
 test("place aliases canonicalize future mention-only observations", async () => {
   const mem = makeMemory();
   const first = await mem.rememberPlace(raw("Botanica", 35.61, 139.71, ["quiet", "work"]), { userId: "u", relationship: "visited" });
@@ -676,6 +769,18 @@ test("place aliases canonicalize future mention-only observations", async () => 
   assert.equal(memories[0]!.place!.name, "Botanica");
   assert.equal(memories[0]!.memory.relationship, "loved");
   assert.ok(mem.placeAliases("u", first.placeId).some((a) => a.normalized === "the plant cafe"));
+});
+
+test("generic place suffix aliases canonicalize shorter later mentions", async () => {
+  const mem = makeMemory();
+  const first = await mem.rememberPlace(raw("Blue Bottle Coffee", 35.6, 139.7, ["coffee"]), { userId: "u", relationship: "visited" });
+  assert.ok(mem.placeAliases("u", first.placeId).some((a) => a.normalized === "blue bottle"));
+  const res = await mem.observe([{ role: "user", content: "I loved Blue Bottle today" }], { userId: "u" });
+  assert.equal(res.actions[0]!.placeId, first.placeId);
+  const memories = mem.listMemories("u");
+  assert.equal(memories.length, 1);
+  assert.equal(memories[0]!.place!.name, "Blue Bottle Coffee");
+  assert.equal(memories[0]!.memory.relationship, "loved");
 });
 
 test("observe learns context-conditioned calibration from the turn's intent", async () => {
@@ -709,6 +814,27 @@ test("structured extraction: per-place sentiment + named region (LLM-shaped)", a
   assert.equal(getCalibration(mem.db, "u", "near", "date").value, 4); // accepted 4km for a date
 });
 
+test("place tags use per-place goal instead of noisy frame goals", async () => {
+  const memExtractor: MemoryExtractor = {
+    async extract(): Promise<ExtractedPlace[]> {
+      return [{ name: "Quiet Beans", relationship: "loved", companions: [], region: null, measures: [], goal: "work", concepts: ["quiet"] }];
+    },
+  };
+  const noisyTagger: Tagger = {
+    async concepts() { return []; },
+    async intents() { return [{ purpose: "study", score: 1 }]; },
+    async frame(text: string) {
+      return { rawQuery: text, goals: ["study", "hangout"], companions: null, occasion: null, concepts: [], vibe: [], constraints: {} };
+    },
+  };
+  const mem = new OpenMap(new DB(":memory:"), null, new HeuristicExtractor(), noisyTagger, 60, memExtractor);
+  await mem.observe([{ role: "user", content: "Pick Quiet Beans for work calls; loved the quiet tables." }], { userId: "u" });
+  const tags = mem.listMemories("u")[0]!.place!.tags;
+  assert.ok(tags.includes("work"));
+  assert.ok(!tags.includes("study"));
+  assert.ok(!tags.includes("hangout"));
+});
+
 test("key-free observe scopes sentiment, concepts, measures, and regions per place", async () => {
   const mem = makeMemory();
   await mem.observe(
@@ -739,6 +865,31 @@ test("negative place experience becomes avoid-persona context", async () => {
   assert.doesNotMatch(ctx.system, /Likes:.*loud/);
 });
 
+test("vibe words inside place names do not become liked concepts", async () => {
+  const mem = makeMemory();
+  await mem.observe([{ role: "user", content: "Noisy Oyster was surprisingly quiet and I loved it for date night." }], { userId: "u" });
+  mem.consolidate("u");
+  const place = mem.listMemories("u").find((it) => it.place?.name === "Noisy Oyster")?.place;
+  assert.ok(place);
+  assert.ok(!place.tags.includes("loud"));
+  assert.ok(mem.beliefs("u", { predicate: "likes" }).some((b) => b.object === "quiet"));
+  assert.ok(!mem.beliefs("u", { predicate: "likes" }).some((b) => b.object === "loud"));
+
+  const ranked = rankMemory({
+    items: [{ place, embedding: null, aggAffect: 1, relationship: "loved" }],
+    relevance: new Map([[place.id, 1]]),
+    tasteSim: [0],
+    prefs: emptyPrefs(),
+    frame: { rawQuery: "quiet date night", goals: ["date"], companions: null, occasion: null, concepts: [], vibe: ["quiet"], constraints: { noise: "quiet" } },
+    near: null,
+    nearRadiusKm: 3,
+    limit: 1,
+  })[0]!;
+  assert.doesNotMatch(String(ranked.reasons.placeVibe), /loud/);
+  assert.match(String(ranked.reasons.constraintHits), /noise:quiet/);
+  assert.doesNotMatch(String(ranked.reasons.constraintMisses), /noise:quiet/);
+});
+
 test("observe does not learn from a rejection", async () => {
   const mem = makeMemory();
   await mem.observe(
@@ -749,6 +900,40 @@ test("observe does not learn from a rejection", async () => {
     { userId: "v" },
   );
   assert.equal(mem.anchors("v").nearRadiusKm, 2); // unchanged prior — rejection
+});
+
+test("observe skips explicitly negated mentioned places in corrections", async () => {
+  const fake: MemoryExtractor = {
+    async extract(): Promise<ExtractedPlace[]> {
+      return [
+        { name: "Central Perk", relationship: "disliked", companions: [], region: null, measures: [], goal: null, concepts: [] },
+        { name: "Central Park Cafe", relationship: "loved", companions: [], region: null, measures: [], goal: null, concepts: ["coffee"] },
+      ];
+    },
+  };
+  const mem = new OpenMap(new DB(":memory:"), new FakeEmbedder(), new HeuristicExtractor(), new LexiconTagger(), 60, fake);
+  await mem.observe([{ role: "user", content: "Not Central Perk, I meant Central Park Cafe; Central Perk was just a TV joke." }], { userId: "u" });
+  assert.equal(mem.listMemories("u").filter((it) => it.place?.name === "Central Perk").length, 0);
+  assert.equal(mem.listMemories("u").find((it) => it.place?.name === "Central Park Cafe")?.memory.relationship, "loved");
+});
+
+test("observe skips logistical rejection even if the extractor returns the suggestion", async () => {
+  const fake: MemoryExtractor = {
+    async extract(): Promise<ExtractedPlace[]> {
+      return [{ name: "Ramen Nagi", relationship: "disliked", companions: [], region: null, measures: [{ term: "near", value: 8 }], goal: null, concepts: ["ramen"] }];
+    },
+  };
+  const mem = new OpenMap(new DB(":memory:"), new FakeEmbedder(), new HeuristicExtractor(), new LexiconTagger(), 60, fake);
+  const res = await mem.observe(
+    [
+      { role: "assistant", content: "Ramen Nagi is 8km away and usually has a long wait." },
+      { role: "user", content: "Skip Ramen Nagi tonight; 8km is too far and the wait is too long." },
+    ],
+    { userId: "u" },
+  );
+  assert.equal(res.actions.length, 0);
+  assert.equal(mem.listMemories("u").filter((it) => it.place?.name === "Ramen Nagi").length, 0);
+  assert.equal(mem.calibrations("u").find((c) => c.term === "near")?.samples, 0);
 });
 
 test("LLM extraction runs through an injectable runner (host model / BYOC)", async () => {
@@ -811,6 +996,135 @@ test("LLM memory extraction merges scoped fallback constraint measures", async (
   assert.ok(mem.calibrations("u").some((c) => c.term === "transit_walk@study" && c.value === 2));
 });
 
+test("LLM fallback enrichment does not leak concepts or measures from other place names", async () => {
+  const runner: LLMRunner = {
+    async run() {
+      return JSON.stringify({
+        places: [
+          { name: "Bella", relationship: "loved", companions: [], region: "Shibuya", measures: [], goal: "date", concepts: [] },
+          { name: "Noisy Joe", relationship: "disliked", companions: [], region: null, measures: [], goal: "date", concepts: [] },
+        ],
+      });
+    },
+  };
+  const mem = new OpenMap(
+    new DB(":memory:"),
+    null,
+    new HeuristicExtractor(),
+    new LexiconTagger(),
+    60,
+    new LLMMemoryExtractor(runner, "test"),
+  );
+  const res = await mem.observe([{ role: "user", content: "Date night at Bella in Shibuya was lovely, Noisy Joe was awful." }], { userId: "u" });
+  const byName = Object.fromEntries(mem.listMemories("u").map((it) => [it.place!.name, it.place!]));
+  assert.equal(res.actions.length, 2);
+  assert.ok(!byName["Bella"]!.tags.includes("loud"));
+  assert.ok(!res.learned.some((m) => m.term === "noise" && m.value >= 0.8));
+});
+
+test("LLM memory extraction normalizes contradictory ambient concepts", async () => {
+  const runner: LLMRunner = {
+    async run() {
+      return JSON.stringify({
+        places: [
+          {
+            name: "Study Hall",
+            relationship: "loved",
+            companions: [],
+            region: null,
+            measures: [],
+            goal: "study",
+            concepts: ["uncrowded", "crowded", "low-noise", "loud"],
+          },
+        ],
+      });
+    },
+  };
+  const extracted = await new LLMMemoryExtractor(runner, "any-model").extract('"Study Hall" is uncrowded and low-noise; pick "Study Hall"');
+  assert.ok(extracted[0]!.concepts?.includes("low_crowd"));
+  assert.ok(extracted[0]!.concepts?.includes("quiet"));
+  assert.ok(!extracted[0]!.concepts?.includes("crowded"));
+  assert.ok(!extracted[0]!.concepts?.includes("loud"));
+});
+
+test("LLM memory extraction drops ungrounded generated tags", async () => {
+  const runner: LLMRunner = {
+    async run() {
+      return JSON.stringify({
+        places: [
+          {
+            name: "Botanica",
+            relationship: "loved",
+            companions: [],
+            region: null,
+            measures: [],
+            goal: "work",
+            concepts: ["coffee", "quiet"],
+          },
+        ],
+      });
+    },
+  };
+  const extracted = await new LLMMemoryExtractor(runner, "any-model").extract('For work calls, pick "Botanica" — I loved the quiet tables.');
+  assert.ok(extracted[0]!.concepts?.includes("quiet"));
+  assert.ok(!extracted[0]!.concepts?.includes("coffee"));
+});
+
+test("LLM memory extraction drops ungrounded generated measures", async () => {
+  const runner: LLMRunner = {
+    async run() {
+      return JSON.stringify({
+        places: [
+          {
+            name: "Ritual Coffee",
+            relationship: "loved",
+            companions: [],
+            region: null,
+            measures: [
+              { term: "near", value: 3 },
+              { term: "budget", value: 0.7 },
+              { term: "noise", value: 0.5 },
+              { term: "crowd", value: 0.5 },
+            ],
+            goal: null,
+            concepts: ["coffee"],
+          },
+        ],
+      });
+    },
+  };
+  const extracted = await new LLMMemoryExtractor(runner, "any-model").extract(
+    'let\'s do "Ritual Coffee" — went there and loved it',
+    { context: 'Morning! Coffee near you: "Blue Bottle" 0.4km, "Ritual Coffee" 3km.' },
+  );
+  assert.deepEqual(extracted[0]!.measures, [{ term: "near", value: 3 }]);
+});
+
+test("LLM memory extraction accepts evidence-cited dynamic tags and measures", async () => {
+  const runner: LLMRunner = {
+    async run() {
+      return JSON.stringify({
+        places: [
+          {
+            name: "Arcade Plaza",
+            relationship: "liked",
+            companions: [],
+            region: null,
+            measures: [{ term: "crowd", value: 0.92, evidence: "shoulder-to-shoulder" }],
+            goal: "hangout",
+            concepts: [{ tag: "crowded", evidence: "shoulder-to-shoulder" }],
+          },
+        ],
+      });
+    },
+  };
+  const extracted = await new LLMMemoryExtractor(runner, "any-model").extract(
+    'I still liked "Arcade Plaza" for a hangout even though it was shoulder-to-shoulder.',
+  );
+  assert.deepEqual(extracted[0]!.measures, [{ term: "crowd", value: 0.92 }]);
+  assert.ok(extracted[0]!.concepts?.includes("crowded"));
+});
+
 test("LLM memory extraction ignores zero spatial and budget measures", async () => {
   const runner: LLMRunner = {
     async run() {
@@ -835,7 +1149,7 @@ test("LLM memory extraction ignores zero spatial and budget measures", async () 
       });
     },
   };
-  const extracted = await new LLMMemoryExtractor(runner, "any-model").extract('pick "Study Hall"');
+  const extracted = await new LLMMemoryExtractor(runner, "any-model").extract('pick "Study Hall" because it had 0/10 noise and around ¥500.');
   assert.deepEqual(extracted[0]!.measures, [
     { term: "noise", value: 0 },
     { term: "budget", value: 500 },

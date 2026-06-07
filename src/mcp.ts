@@ -6,8 +6,8 @@ process.on("warning", (w) => {
 });
 
 import { z } from "zod";
-import { buildOpenMap } from "./openmap.js";
 import { type Place, type ScoredPlace, personaPrefsSchema, relationshipSchema } from "./core/types.js";
+import { MEASURE_TERMS } from "./core/vocabulary.js";
 
 const placeBrief = (p: Place) => ({
   name: p.name, placeId: p.id, category: p.category, address: p.address, lat: p.lat, lng: p.lng, tags: p.tags,
@@ -40,6 +40,7 @@ export async function main(): Promise<void> {
     process.exit(1);
   }
 
+  const { buildOpenMap } = await import("./openmap.js");
   const mem = buildOpenMap();
   const server = new McpServer({ name: "openmap", version: "0.3.0" });
 
@@ -206,7 +207,7 @@ export async function main(): Promise<void> {
     "calibrate",
     "Teach what a fuzzy place term means to this user from one accepted sample (revealed preference). term: near (km) | walk_time/transit_walk (min) | budget (spend) | noise/crowd (0..1). E.g. they picked a place 3km away → calibrate near 3.",
     {
-      term: z.enum(["near", "walk_time", "budget", "noise", "crowd", "transit_walk"]),
+      term: z.enum(MEASURE_TERMS),
       value: z.number(),
       context: z.string().optional(),
       userId: z.string().optional(),
@@ -308,4 +309,8 @@ export async function main(): Promise<void> {
 }
 
 const isMain = process.argv[1] && import.meta.url === `file://${process.argv[1]}`;
-if (isMain) main();
+if (isMain)
+  main().catch((err) => {
+    console.error(err instanceof Error ? err.message : String(err));
+    process.exit(1);
+  });

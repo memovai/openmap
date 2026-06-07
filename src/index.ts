@@ -81,6 +81,18 @@ export type {
 } from "./search/assist.js";
 
 export { haversineKm, geoBonus, geoGate, geoAffinity } from "./core/geo.js";
+export {
+  ALLOWED_GOALS,
+  CONCEPT_LEXICON,
+  TAG_TO_CONCEPT,
+  INTENT_LEXICON,
+  VIBE_CONCEPTS as DEFAULT_VIBE_CONCEPTS,
+  NEGATIVE_AFFORDANCE_CONCEPTS,
+  MEASURE_TERMS,
+  constraintConceptTerms,
+  conceptLabel,
+} from "./core/vocabulary.js";
+export type { MeasureTerm } from "./core/vocabulary.js";
 
 export {
   RELATIONSHIPS,
@@ -90,6 +102,7 @@ export {
   affectFor,
   makePlaceId,
   placeTextBlob,
+  placeAttributeBlob,
   rawToPlace,
   mentionToPlace,
   emptyPrefs,

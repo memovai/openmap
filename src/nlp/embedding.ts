@@ -16,8 +16,8 @@ function l2normalize(v: Float32Array): Float32Array {
 
 /** Real embeddings over any OpenAI-compatible endpoint (BYOC: OpenAI / Gemini /
  * local server). `openai` is imported lazily so it stays an optional dep. There
- * is no built-in offline embedder — without a provider, recall runs keyword-only
- * (FTS5/BM25); we don't fake semantics with a hashing trick. */
+ * is no built-in offline embedder; test/eval code may explicitly opt into
+ * keyword-only recall, but public builders require a model. */
 export class OpenAIEmbedder implements Embedder {
   dim = 1536;
   private client: unknown;

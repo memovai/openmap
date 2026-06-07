@@ -1,4 +1,5 @@
 import { type DB } from "../store/db.js";
+import { type MeasureTerm } from "../core/vocabulary.js";
 
 /**
  * Calibration layer — the user's *personal meaning* of fuzzy place predicates,
@@ -22,7 +23,7 @@ export interface TermSpec {
   note: string;
 }
 
-export const TERMS: Record<string, TermSpec> = {
+export const TERMS: Record<MeasureTerm, TermSpec> = {
   near: { defaultValue: 2, agg: "max", unit: "km", note: "radius the user accepts as 'near'" },
   walk_time: { defaultValue: 10, agg: "max", unit: "min", note: "how long they'll walk" },
   budget: { defaultValue: null, agg: "ema", unit: "ccy", note: "typical accepted spend" },
@@ -30,6 +31,8 @@ export const TERMS: Record<string, TermSpec> = {
   crowd: { defaultValue: 0.35, agg: "max", unit: "0..1", note: "highest accepted crowd level" },
   transit_walk: { defaultValue: 8, agg: "max", unit: "min", note: "walk time from transit the user accepts" },
 };
+
+const specFor = (term: string): TermSpec | undefined => TERMS[term as MeasureTerm];
 
 export interface Calibration {
   term: string;
@@ -48,7 +51,7 @@ const baseTerm = (key: string) => key.split("@")[0]!;
  * (if learned), else falls back to the global value, else the prior.
  */
 export function getCalibration(db: DB, userId: string, term: string, context?: string): Calibration {
-  const spec = TERMS[term];
+  const spec = specFor(term);
   if (context) {
     const row = db.getCalibration(userId, keyOf(term, context));
     if (row && row.value != null && row.samples > 0)
@@ -62,7 +65,7 @@ export function getCalibration(db: DB, userId: string, term: string, context?: s
  * the global value (the fallback); when a context is given, also the
  * context-specific value. */
 export function learnCalibration(db: DB, userId: string, term: string, sample: number, context?: string): void {
-  const spec = TERMS[term];
+  const spec = specFor(term);
   if (!spec || !Number.isFinite(sample)) return;
   const apply = (key: string) => {
     const cur = db.getCalibration(userId, key);
@@ -78,11 +81,11 @@ export function learnCalibration(db: DB, userId: string, term: string, sample: n
 }
 
 export function allCalibrations(db: DB, userId: string): Calibration[] {
-  const base = Object.keys(TERMS).map((t) => getCalibration(db, userId, t));
+  const base = (Object.keys(TERMS) as MeasureTerm[]).map((t) => getCalibration(db, userId, t));
   const scoped = db
     .listCalibrations(userId)
     .filter((r) => r.term.includes("@"))
-    .map((r) => ({ term: r.term, value: r.value, samples: r.samples, unit: TERMS[baseTerm(r.term)]?.unit ?? "" }));
+    .map((r) => ({ term: r.term, value: r.value, samples: r.samples, unit: specFor(baseTerm(r.term))?.unit ?? "" }));
   return [...base, ...scoped];
 }
 

@@ -2,6 +2,7 @@ import { type DB, buildFtsMatch } from "../store/db.js";
 import { type Embedder, cosineMatrix } from "../nlp/embedding.js";
 import { type Tagger } from "../nlp/tagger.js";
 import { type GeoPoint, type IntentFrame, type PersonaPrefs, type ScoredPlace, emptyPrefs } from "../core/types.js";
+import { constraintConceptTerms } from "../core/vocabulary.js";
 import { defaultAnchor } from "../memory/anchors.js";
 import { getCalibration, nearRadiusKm } from "../memory/calibration.js";
 import { effectiveTaste } from "../memory/taste.js";
@@ -76,14 +77,5 @@ export async function recallPlaces(args: RecallPipelineArgs): Promise<RecallPipe
 }
 
 function constraintQueryTerms(frame: IntentFrame): string[] {
-  const c = frame.constraints;
-  return [
-    ...(c.openNow ? ["open_late"] : []),
-    ...(c.walkable ? ["walkable"] : []),
-    ...(c.dietary ?? []),
-    ...(c.maxBudget ? [c.maxBudget === "low" ? "cheap" : c.maxBudget === "high" ? "fancy" : "mid_budget"] : []),
-    ...(c.noise ? [c.noise === "quiet" ? "quiet low_noise" : c.noise === "loud" ? "loud noisy" : "moderate_noise"] : []),
-    ...(c.crowd ? [c.crowd === "low" ? "low_crowd uncrowded" : c.crowd === "high" ? "crowded busy" : "moderate_crowd"] : []),
-    ...(c.travelMode ? [c.travelMode === "walk" ? "walkable" : c.travelMode === "transit" ? "transit station" : "parking drive"] : []),
-  ];
+  return constraintConceptTerms(frame.constraints);
 }

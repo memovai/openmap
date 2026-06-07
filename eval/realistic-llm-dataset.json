@@ -1,0 +1,115 @@
+{
+  "name": "realistic-llm-place-extraction",
+  "description": "LLM-first realistic map-assistant transcript set. It targets place-name extraction, per-place sentiment, alias/correction handling, false-positive suppression, bilingual turns, and scoped calibration. Every probe is llmOnly by design; regex/lexicon fallback should skip this suite rather than define quality.",
+  "user": "rhea",
+  "sessions": [
+    {
+      "title": "unquoted work cafe choice",
+      "turns": [
+        { "role": "assistant", "content": "Quiet Beans is 0.8km away, quiet, uncrowded, and next to the subway. Roar Cafe is closer but loud and packed." },
+        { "role": "user", "content": "Pick Quiet Beans for work calls — loved the quiet tables by transit." },
+        { "role": "user", "content": "I tried Roar Cafe later and disliked it, too loud and crowded for calls." }
+      ]
+    },
+    {
+      "title": "rejection should not create memory",
+      "turns": [
+        { "role": "assistant", "content": "Ramen Nagi is 8km away and usually has a long wait." },
+        { "role": "user", "content": "8km is too far tonight; skip it." }
+      ]
+    },
+    {
+      "title": "explicit rejected suggestion should not become taste memory",
+      "turns": [
+        { "role": "assistant", "content": "Ramen Nagi is 8km away and usually has a long wait." },
+        { "role": "user", "content": "Skip Ramen Nagi tonight; 8km is too far and the wait is too long." }
+      ]
+    },
+    {
+      "title": "mixed sentiment without quotes",
+      "turns": [
+        { "role": "user", "content": "Dinner crawl: Stellar was amazing, but Dud Diner was awful." }
+      ]
+    },
+    {
+      "title": "negative adjective in place name",
+      "turns": [
+        { "role": "user", "content": "Noisy Oyster was surprisingly quiet and lovely for date night." }
+      ]
+    },
+    {
+      "title": "region and per-place opposite sentiment",
+      "turns": [
+        { "role": "user", "content": "Date night at Bella in Shibuya was lovely, Noisy Joe was awful." }
+      ]
+    },
+    {
+      "title": "generic suffix alias",
+      "turns": [
+        { "role": "user", "content": "Blue Bottle Coffee near Mint Plaza was solid for a quick espresso." },
+        { "role": "user", "content": "Back at Blue Bottle today; loved it." }
+      ]
+    },
+    {
+      "title": "ordinary phrase false positive",
+      "turns": [
+        { "role": "assistant", "content": "The place is popular, but the line is usually long." },
+        { "role": "user", "content": "The line was too long, so skip it. No place to remember from that." }
+      ]
+    },
+    {
+      "title": "bilingual study room choice",
+      "turns": [
+        { "role": "assistant", "content": "Jing'an Study Room in Jing'an is quiet, low-noise, near the metro, and uncrowded. Nanjing Arcade is packed, loud, and touristy." },
+        { "role": "user", "content": "下午要学习, pick Jing'an Study Room — loved the low-noise tables by the metro." },
+        { "role": "user", "content": "我后来 tried Nanjing Arcade and disliked it; too loud and crowded for studying." }
+      ]
+    },
+    {
+      "title": "family stroller brunch",
+      "turns": [
+        { "role": "assistant", "content": "Maple Yard is outdoor, calm, stroller friendly, low crowd, a 10 minute walk, about $30. Tiny Counter is cramped, noisy, and packed." },
+        { "role": "user", "content": "For family brunch with the baby stroller, pick Maple Yard — loved the outdoor calm space and low crowd." },
+        { "role": "user", "content": "Skip Tiny Counter next time; I disliked how noisy and packed it felt." }
+      ]
+    },
+    {
+      "title": "correction should pick the real place",
+      "turns": [
+        { "role": "user", "content": "Not Central Perk, I meant Central Park Cafe; Central Perk was just a TV joke." },
+        { "role": "user", "content": "I went to Central Park Cafe later and loved it for coffee." }
+      ]
+    }
+  ],
+  "probes": [
+    { "kind": "memory", "category": "llm-unquoted-place", "place": "Quiet Beans", "expectRelationship": "loved", "llmOnly": true },
+    { "kind": "memory", "category": "llm-unquoted-negative", "place": "Roar Cafe", "expectRelationship": "disliked", "llmOnly": true },
+    { "kind": "calibration", "category": "llm-scoped-calibration", "term": "near", "context": "work", "min": 0.5, "max": 1.5, "llmOnly": true },
+    { "kind": "memory", "category": "llm-rejection", "place": "Ramen Nagi", "expectCount": 0, "llmOnly": true },
+    { "kind": "memory", "category": "llm-mixed-sentiment", "place": "Stellar", "expectRelationship": "loved", "llmOnly": true },
+    { "kind": "memory", "category": "llm-mixed-sentiment", "place": "Dud Diner", "expectRelationship": "disliked", "llmOnly": true },
+    { "kind": "memory", "category": "llm-name-adjective", "place": "Noisy Oyster", "expectRelationship": "loved", "llmOnly": true },
+    { "kind": "belief", "category": "llm-name-adjective-not-like", "predicate": "likes", "object": "loud", "expectPresent": false, "llmOnly": true },
+    { "kind": "memory", "category": "llm-region-sentiment", "place": "Bella", "expectRelationship": "loved", "llmOnly": true },
+    { "kind": "memory", "category": "llm-region-sentiment", "place": "Noisy Joe", "expectRelationship": "disliked", "llmOnly": true },
+    { "kind": "belief", "category": "llm-region", "predicate": "frequents", "object": "Shibuya", "llmOnly": true },
+    { "kind": "reconcile", "category": "llm-alias-reconcile", "place": "Blue Bottle Coffee", "expectCount": 1, "expectRelationship": "loved", "llmOnly": true },
+    { "kind": "memory", "category": "llm-false-positive", "place": "The Line", "expectCount": 0, "llmOnly": true },
+    { "kind": "memory", "category": "llm-bilingual", "place": "Jing'an Study Room", "expectRelationship": "loved", "llmOnly": true },
+    { "kind": "memory", "category": "llm-bilingual", "place": "Nanjing Arcade", "expectRelationship": "disliked", "llmOnly": true },
+    { "kind": "calibration", "category": "llm-transit-calibration", "term": "transit_walk", "context": "study", "min": 1, "max": 5, "llmOnly": true },
+    { "kind": "memory", "category": "llm-family", "place": "Maple Yard", "expectRelationship": "loved", "llmOnly": true },
+    { "kind": "memory", "category": "llm-family-negative", "place": "Tiny Counter", "expectRelationship": "disliked", "llmOnly": true },
+    { "kind": "memory", "category": "llm-correction", "place": "Central Perk", "expectCount": 0, "llmOnly": true },
+    { "kind": "memory", "category": "llm-correction", "place": "Central Park Cafe", "expectRelationship": "loved", "llmOnly": true },
+    { "kind": "ask", "category": "llm-avoidance", "question": "do I avoid loud places?", "expectLikely": true, "llmOnly": true },
+    { "kind": "belief", "category": "llm-avoidance", "predicate": "avoids", "object": "loud", "llmOnly": true },
+    { "kind": "belief", "category": "llm-category-not-avoid", "predicate": "avoids", "object": "coffee", "expectPresent": false, "llmOnly": true },
+    { "kind": "belief", "category": "llm-low-crowd-not-like-crowded", "predicate": "likes", "object": "crowded", "expectPresent": false, "llmOnly": true },
+    { "kind": "recall", "category": "llm-study-recall", "query": "quiet study room near metro", "expectTop": "Jing'an Study Room", "expectNotTop": "Nanjing Arcade", "llmOnly": true },
+    { "kind": "recall", "category": "llm-date-recall", "query": "quiet date night dinner", "expectIncludes": "Bella", "expectNotTop": "Noisy Joe", "llmOnly": true },
+    { "kind": "citation", "category": "llm-grounding", "query": "somewhere quiet for work calls", "place": "Quiet Beans", "expectIncludes": "loved the quiet tables", "llmOnly": true },
+    { "kind": "scenario", "category": "llm-scenario", "expectPlace": "Jing'an Study Room", "expectOtherPlace": "Nanjing Arcade", "expectIntent": "study", "expectConceptsInclude": ["quiet", "transit"], "minTurns": 3, "llmOnly": true },
+    { "kind": "persona", "category": "llm-context", "query": "quiet study room near metro", "expectSystemIncludes": ["Avoids", "loud"], "expectPrependIncludes": ["Jing'an Study Room"], "expectSystemExcludes": ["Avoids: coffee"], "llmOnly": true }
+  ]
+}

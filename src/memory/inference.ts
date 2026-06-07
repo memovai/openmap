@@ -1,6 +1,7 @@
 import { type DB } from "../store/db.js";
 import { conceptsFromTags, extractConcepts, inferRelationship } from "../nlp/extract.js";
 import { type Belief, type Memory, type Predicate, type ProvenanceRef, type Relationship, nowIso } from "../core/types.js";
+import { NEGATIVE_AFFORDANCE_CONCEPTS } from "../core/vocabulary.js";
 
 // ── reconcile: decide ADD / UPDATE / NOOP for a new place observation ───────
 export type ReconcileAction = "add" | "update" | "noop";
@@ -107,6 +108,7 @@ export function inferConcept(
     }
   }
   for (const r of remembered) {
+    if (predicate === "avoids" && !NEGATIVE_AFFORDANCE_CONCEPTS.has(concept)) continue;
     const affectSignal = predicate === "avoids" ? Math.max(0, -r.aggAffect) : Math.max(0, r.aggAffect);
     if (affectSignal <= 0) continue;
     signal += affectSignal;

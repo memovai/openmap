@@ -1,4 +1,5 @@
 import { createHash } from "node:crypto";
+import { PLACE_ATTRIBUTE_RAW_KEYS } from "./vocabulary.js";
 import { z } from "zod";
 
 export const DEFAULT_USER = "default";
@@ -58,6 +59,26 @@ export function placeTextBlob(p: Place): string {
     .filter((s) => s && s.trim())
     .join(" — ")
     .trim();
+}
+
+/** Text describing place attributes, excluding the name so names like
+ * "Noisy Oyster" do not become evidence that the place is loud. */
+export function placeAttributeBlob(p: Place): string {
+  const raw = Object.entries(p.raw)
+    .filter(([key]) => PLACE_ATTRIBUTE_RAW_KEYS.has(key))
+    .flatMap(([, value]) => rawText(value));
+  return [p.category ?? "", p.address ?? "", p.tags.join(" "), ...raw]
+    .filter((s) => s && s.trim())
+    .join(" — ")
+    .trim();
+}
+
+function rawText(value: unknown): string[] {
+  if (typeof value === "string") return [value];
+  if (Array.isArray(value)) return value.flatMap(rawText);
+  if (value && typeof value === "object")
+    return Object.values(value as Record<string, unknown>).flatMap(rawText);
+  return [];
 }
 
 /** A place as extracted from conversation (or handed in by the host agent),

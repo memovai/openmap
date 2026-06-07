@@ -1,14 +1,14 @@
 import { type Config } from "../core/config.js";
 import { type LLMRunner, extractJson } from "./llm.js";
-import { ALLOWED_GOALS, buildIntentPrompt } from "../prompts/intent.js";
+import { buildIntentPrompt } from "../prompts/intent.js";
 import {
   type ScoredIntent,
-  VIBE_CONCEPTS,
   extractConcepts,
   inferCompanion,
   inferIntents,
 } from "./extract.js";
 import { type IntentFrame, emptyFrame } from "../core/types.js";
+import { ALLOWED_GOALS, CONSTRAINT_MATCH_TERMS, FAMILY_COMPANIONS, FAMILY_INCOMPATIBLE_GOALS, FRAME_CONSTRAINT_CONCEPTS, VIBE_CONCEPTS } from "../core/vocabulary.js";
 
 /** Resolves the latent situational intent behind a maps query, plus the
  * concepts/intents used for behavioral memory. The lexicon version is key-free
@@ -35,30 +35,43 @@ export function lexiconFrame(text: string): IntentFrame {
   f.vibe = concepts.filter((c) => VIBE_CONCEPTS.has(c));
   f.goals = inferIntents(text).map((i) => i.purpose);
   // you don't take a "date" with your parents/kids — drop the contradiction
-  if (f.companions && ["parents", "kids", "family"].includes(f.companions))
-    f.goals = f.goals.filter((g) => g !== "date" && g !== "romance");
-  if (concepts.includes("cheap")) f.constraints.maxBudget = "low";
-  if (concepts.includes("fancy")) f.constraints.maxBudget = "high";
-  if (concepts.includes("vegetarian")) f.constraints.dietary = ["vegetarian"];
-  if (concepts.includes("open_late")) f.constraints.openNow = true;
-  if (concepts.includes("walkable")) {
+  if (f.companions && FAMILY_COMPANIONS.has(f.companions))
+    f.goals = f.goals.filter((g) => !FAMILY_INCOMPATIBLE_GOALS.has(g));
+  if (concepts.includes(FRAME_CONSTRAINT_CONCEPTS.budget.low)) f.constraints.maxBudget = "low";
+  if (concepts.includes(FRAME_CONSTRAINT_CONCEPTS.budget.high)) f.constraints.maxBudget = "high";
+  const dietary = FRAME_CONSTRAINT_CONCEPTS.dietary.filter((c) => concepts.includes(c));
+  if (dietary.length) f.constraints.dietary = dietary;
+  if (concepts.includes(FRAME_CONSTRAINT_CONCEPTS.openNow)) f.constraints.openNow = true;
+  if (concepts.includes(FRAME_CONSTRAINT_CONCEPTS.walkable)) {
     f.constraints.walkable = true;
     f.constraints.travelMode = "walk";
   }
   if (wantsQuiet(lower)) f.constraints.noise = "quiet";
-  else if (concepts.includes("loud")) f.constraints.noise = "loud";
+  else if (concepts.includes(FRAME_CONSTRAINT_CONCEPTS.noise.loud)) f.constraints.noise = "loud";
   if (wantsLowCrowd(lower)) f.constraints.crowd = "low";
-  else if (concepts.includes("crowded")) f.constraints.crowd = "high";
-  if (/\b(?:transit|station|subway|metro|train|bus)\b/.test(lower)) f.constraints.travelMode = "transit";
-  if (/\b(?:parking|drive|driving|car|valet)\b/.test(lower)) f.constraints.travelMode = "drive";
+  else if (concepts.includes(FRAME_CONSTRAINT_CONCEPTS.crowd.high)) f.constraints.crowd = "high";
+  if (concepts.includes(FRAME_CONSTRAINT_CONCEPTS.travelMode.transit)) f.constraints.travelMode = "transit";
+  if (concepts.includes(FRAME_CONSTRAINT_CONCEPTS.travelMode.drive)) f.constraints.travelMode = "drive";
   return f;
 }
 
 const wantsQuiet = (lower: string) =>
-  /\b(?:quiet|calm|peaceful|low noise|not noisy|not loud|not too noisy|not too loud|without noise|avoid noise|avoid noisy|no loud music)\b/.test(lower);
+  hasPhrase(lower, CONSTRAINT_MATCH_TERMS.noise.quiet);
 
 const wantsLowCrowd = (lower: string) =>
-  /\b(?:uncrowded|not crowded|not busy|not too crowded|not too busy|without crowds?|avoid crowds?|no crowds?|no line|no queue)\b/.test(lower);
+  hasPhrase(lower, CONSTRAINT_MATCH_TERMS.crowd.low);
+
+function hasPhrase(lower: string, terms: string[]): boolean {
+  return terms.some((term) => new RegExp(`\\b${termPattern(term)}\\b`).test(lower));
+}
+
+function termPattern(term: string): string {
+  return term.split(/[\s_-]+/).map(escapeRegExp).join("[-_\\s]+");
+}
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
 
 export class LexiconTagger implements Tagger {
   async frame(text: string): Promise<IntentFrame> {
@@ -74,7 +87,6 @@ export class LexiconTagger implements Tagger {
 }
 
 export class LLMTagger implements Tagger {
-  private fallback = new LexiconTagger();
   private memo: { text: string; frame: IntentFrame } | null = null;
 
   constructor(
@@ -121,12 +133,12 @@ export class LLMTagger implements Tagger {
       }
       merged.dietary = [...new Set([...(lexical.constraints.dietary ?? []), ...(f.constraints.dietary ?? [])])];
       f.constraints = merged;
-      if (f.companions && ["parents", "kids", "family"].includes(f.companions))
-        f.goals = f.goals.filter((g) => g !== "date" && g !== "romance");
+      if (f.companions && FAMILY_COMPANIONS.has(f.companions))
+        f.goals = f.goals.filter((g) => !FAMILY_INCOMPATIBLE_GOALS.has(g));
       this.memo = { text, frame: f };
       return f;
-    } catch {
-      return this.fallback.frame(text);
+    } catch (err) {
+      throw new Error(`LLM intent extraction failed: ${err instanceof Error ? err.message : String(err)}`);
     }
   }
 

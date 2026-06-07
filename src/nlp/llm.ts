@@ -5,8 +5,8 @@ import { type Config } from "../core/config.js";
  * memory extractor) calls this instead of holding its own client, so it can:
  *  - **borrow the host agent's model** (inject your own LLMRunner — like an
  *    OpenClaw/Hermes runtime), or
- *  - use a **BYOC** OpenAI-compatible endpoint (OpenAILLMRunner + baseURL), or
- *  - fall back to the offline lexicon/heuristic path (runner = null).
+ *  - use a **BYOC** OpenAI-compatible endpoint (OpenAILLMRunner + baseURL).
+ * Public OpenMap builders require this runner; key-free heuristics are test-only.
  */
 export interface LLMRunner {
   run(opts: { system?: string; prompt: string; json?: boolean; model?: string }): Promise<string>;
@@ -55,7 +55,7 @@ export function extractJson(text: string): string {
 }
 
 /** Resolve a runner from config: an OpenAI-compatible one when a key is set,
- * else null (offline). A host can bypass this by injecting its own runner. */
+ * else null. A host can bypass this by injecting its own runner. */
 export function getRunner(cfg: Config): LLMRunner | null {
   return cfg.openaiApiKey ? new OpenAILLMRunner(cfg.openaiApiKey, cfg.openaiBaseUrl, cfg.openaiChatModel) : null;
 }

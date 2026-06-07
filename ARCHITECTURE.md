@@ -39,9 +39,9 @@ make it map-aware and personal:
 - **SQLite + sqlite-vec.** Place embeddings live in a `vec0` virtual table (cosine
   KNN), with a brute-force fallback if the extension can't load. `node:sqlite` =
   no native build; an agent can `npm install` and go.
-- **LLM-first NLP, lexicon fallback.** Extraction/intent use an LLM when keyed
-  (per-component models); a key-free lexicon keeps it offline and deterministic for
-  tests, and handles simple negation/contradiction.
+- **LLM-required public NLP.** Extraction/intent use an LLM or injected host
+  runner (per-component models). Key-free lexicon/heuristic components remain
+  deterministic test helpers, but public builders fail fast without a model.
 - **Learned, not hardcoded.** "near" is a per-user learned radius (the calibration
   layer), not a constant — and the same mechanism generalizes to walk_time, budget,
   noise: add a term, no new logic.

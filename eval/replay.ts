@@ -101,8 +101,8 @@ async function main() {
   const datasetPath = resolveDatasetPath(argValue("--dataset", "dataset.json"));
   const dataset = JSON.parse(await readFile(datasetPath, "utf-8")) as EvalDataset;
   const cfg = { ...loadConfig(), dbPath: ":memory:" };
-  const mem = buildOpenMap(cfg);
   const llmAvailable = Boolean(cfg.openaiApiKey);
+  const mem = buildOpenMap(cfg, { allowHeuristicFallbackForTests: !llmAvailable });
   const snapshot = await buildReplaySnapshot(dataset, mem, {
     llmAvailable,
     model: llmAvailable ? cfg.openaiChatModel : null,

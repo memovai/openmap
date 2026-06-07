@@ -8,7 +8,7 @@ process.on("warning", (w) => {
 
 import { readFile } from "node:fs/promises";
 import { Command } from "commander";
-import { loadConfig, resolvedEmbedder, resolvedTagger } from "./core/config.js";
+import { LEXICON_DISABLED_ERROR, MODEL_REQUIRED_ERROR, loadConfig, resolvedEmbedder, resolvedTagger } from "./core/config.js";
 import type { CandidatePlaceInput, ConversationTurn } from "./openmap.js";
 import type { RankedCandidatePlace } from "./search/assist.js";
 import {
@@ -218,13 +218,89 @@ async function routinesAction(o: AnyOptions) {
 
 function configAction() {
   const c = loadConfig();
+  const tagger = resolvedTagger(c);
+  const ready = Boolean(c.openaiApiKey) && tagger === "llm";
   emit({
     dbPath: c.dbPath,
     embedder: resolvedEmbedder(c),
-    tagger: resolvedTagger(c),
+    tagger,
     openaiKey: Boolean(c.openaiApiKey),
     baseUrl: c.openaiBaseUrl,
-    llm: c.openaiApiKey ? (c.openaiBaseUrl ? "openai-compatible (BYOC)" : "openai") : "offline (inject a runner to use a model)",
+    llm: c.openaiApiKey ? (c.openaiBaseUrl ? "openai-compatible (BYOC)" : "openai") : "missing",
+    ready,
+    error: ready ? null : tagger === "disabled" ? LEXICON_DISABLED_ERROR : MODEL_REQUIRED_ERROR,
+  });
+}
+
+async function onboardAction(o: AnyOptions) {
+  const c = loadConfig();
+  const tagger = resolvedTagger(c);
+  const ready = Boolean(c.openaiApiKey) && tagger === "llm";
+  const status = {
+    dbPath: c.dbPath,
+    embedder: resolvedEmbedder(c),
+    tagger,
+    placeExtraction: ready ? "llm" : "disabled - model required",
+    llm: c.openaiApiKey ? (c.openaiBaseUrl ? "openai-compatible (BYOC)" : "openai") : "missing",
+    ready,
+    error: ready ? null : tagger === "disabled" ? LEXICON_DISABLED_ERROR : MODEL_REQUIRED_ERROR,
+  };
+  const guidance = {
+    production: [
+      "Configure OPENAI_API_KEY, GEMINI_API_KEY, GOOGLE_API_KEY, or inject the host agent's model in library mode.",
+      "OpenMap no longer runs a key-free offline fallback from CLI/MCP/public builders.",
+      "Canonicalize live places with the host map provider's stable place id when possible.",
+      "Wire capture after each exchange and recall_context/local_search_context before map answers.",
+    ],
+    privacy: [
+      "openmap stores raw turns and place preferences locally in SQLite.",
+      "Ask user consent before capturing location-bearing conversations.",
+      "Expose list/forget/export flows in the host UI before shipping beyond local use.",
+    ],
+    commands: {
+      inspectConfig: "openmap config",
+      runDemo: "openmap onboard --demo",
+      beforeAnswer: 'openmap -u alice context "quiet coffee for work"',
+      afterExchange: "openmap -u alice observe transcript.json",
+      beforeMapSearch: 'openmap -u alice plan "coffee near me" --near 37.77,-122.42',
+      afterMapSearch: 'openmap -u alice rerank "coffee near me" candidates.json --near 37.77,-122.42',
+    },
+  };
+  if (!o.demo) {
+    emit({ status, guidance });
+    return;
+  }
+
+  const { buildOpenMap } = await import("./openmap.js");
+  const mem = buildOpenMap({ ...c, dbPath: ":memory:" });
+  const userId = "demo";
+  const messages: ConversationTurn[] = [
+    { role: "assistant", content: '"Quiet Beans" is 0.8km away, quiet, uncrowded, and next to the subway. "Roar Cafe" is closer but loud and packed.' },
+    { role: "user", content: 'Pick "Quiet Beans" for work calls — loved the quiet tables by transit.' },
+    { role: "user", content: 'I disliked "Roar Cafe" later, too loud and crowded.' },
+  ];
+  const capture = await mem.capture(messages, { userId });
+  mem.consolidate(userId);
+  const near = { lat: 37.775, lng: -122.419 };
+  const context = await mem.recallContext("somewhere quiet for calls", { userId, near, limit: 3 });
+  const plan = await mem.planPlaceSearch("coffee near me", { userId, near });
+  const rerank = await mem.rankCandidatePlaces(
+    "coffee near me",
+    [
+      { name: "Closest Loud Coffee", lat: 37.775, lng: -122.419, tags: ["coffee", "loud", "crowded"] },
+      { name: "Calm Work Cafe", lat: 37.782, lng: -122.428, tags: ["coffee", "quiet", "work", "low_crowd", "transit"] },
+    ],
+    { userId, near, limit: 2 },
+  );
+  emit({
+    status,
+    demo: {
+      captured: capture,
+      recallContext: { system: context.system, prepend: context.prepend, places: scored(context.places) },
+      plan,
+      rerank: { query: rerank.query, results: rankedCandidates(rerank.results) },
+    },
+    guidance,
   });
 }
 
@@ -501,6 +577,11 @@ addManualCommands(manual);
 cmd(program, "config")
   .description("Show resolved local configuration.")
   .action(configAction);
+
+cmd(program, "onboard")
+  .description("Check first-run integration status and optionally run a no-write demo loop.")
+  .option("--demo", "run a capture → context → plan → rerank demo in an in-memory DB")
+  .action(onboardAction);
 
 cmd(program, "serve")
   .description("Run the MCP server so agents can use openmap as tools.")

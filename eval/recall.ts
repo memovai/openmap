@@ -35,13 +35,16 @@ const raw = (name: string, tags: string[]): RawPlace => ({
 
 async function seedAndScore(embedder: "none" | "openai", embedModel?: string) {
   const cfg = loadConfig();
-  const mem = buildOpenMap({
-    ...cfg,
-    dbPath: ":memory:",
-    embedder, // "none" = keyword-only (FTS/BM25); "openai" = hybrid (keyword + vector RRF)
-    tagger: "lexicon", // hold extraction constant — vary ONLY the embedding arm
-    ...(embedModel ? { openaiEmbedModel: embedModel } : {}),
-  });
+  const mem = buildOpenMap(
+    {
+      ...cfg,
+      dbPath: ":memory:",
+      embedder, // "none" = keyword-only (FTS/BM25); "openai" = hybrid (keyword + vector RRF)
+      tagger: "lexicon", // hold extraction constant — vary ONLY the embedding arm
+      ...(embedModel ? { openaiEmbedModel: embedModel } : {}),
+    },
+    { allowHeuristicFallbackForTests: true },
+  );
   for (const p of places) await mem.rememberPlace(raw(p.name, p.tags), { userId: "u", relationship: "mentioned" });
 
   const rows: Array<{ q: string; expect: string; top: string; rank: number }> = [];

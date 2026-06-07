@@ -1,4 +1,4 @@
-import { type Config, loadConfig } from "./core/config.js";
+import { type Config, assertModelConfigured, loadConfig } from "./core/config.js";
 import { DB, type CollectionInfo, type MemoryListItem, type StoredTurn, buildFtsMatch } from "./store/db.js";
 import { type Embedder, getEmbedder } from "./nlp/embedding.js";
 import { type Extractor, type Measure, conceptsFromTags, extractConcepts, getExtractor } from "./nlp/extract.js";
@@ -34,6 +34,7 @@ import { formatPersonaContext, formatRecallBlock, type RecallBlockSource } from 
 import { type RelatedPlace, relatedPlaces as relatedPlacesOf } from "./world/relations.js";
 import { ALLOWED_GOALS } from "./prompts/intent.js";
 import { canonicalConcepts, createScenarioFromObservation, deriveRoutines } from "./memory/scenarios.js";
+import { GENERIC_PLACE_SUFFIX_TERMS, NAME_DERIVED_CONCEPTS } from "./core/vocabulary.js";
 import {
   DEFAULT_USER,
   type Belief,
@@ -117,6 +118,46 @@ export type { CandidatePlaceInput, CandidateRankingResult, PlaceSearchPlan };
 
 const ACCEPTING = new Set<Relationship>(["visited", "loved", "liked", "want_to_go"]);
 const REJECTION_RE = /too far|too expensive|too pricey|too long|not worth|too much|skip it/i;
+const GENERIC_PLACE_SUFFIX_RE = new RegExp(`\\s+(?:${GENERIC_PLACE_SUFFIX_TERMS.map(escapeRegExp).join("|")})$`, "i");
+const DIRECT_EXPERIENCE_RE = /\b(?:loved|liked|enjoyed|went|visited|tried|been to|ate at|stopped by|grabbed|had (?:lunch|dinner|coffee)|amazing|solid|decent|awful|terrible|hated|disliked|never again)\b/i;
+const LOGISTICAL_REJECTION_RE = /\b(?:skip|pass|too far|too expensive|too pricey|too long|long wait|not worth|too much)\b/i;
+
+function escapeRegExp(s: string): string {
+  return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+function generatedPlaceAliases(name: string): string[] {
+  const aliases = new Set<string>();
+  const trimmed = name.replace(/\s+/g, " ").trim();
+  const withoutGenericSuffix = trimmed.replace(GENERIC_PLACE_SUFFIX_RE, "").trim();
+  if (withoutGenericSuffix && withoutGenericSuffix !== trimmed && withoutGenericSuffix.split(/\s+/).length >= 2)
+    aliases.add(withoutGenericSuffix);
+  return [...aliases];
+}
+
+function shouldSkipNegatedMention(text: string, name: string, relationship: Relationship): boolean {
+  const escaped = name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const negated =
+    new RegExp(`\\b(?:not|no|不是|不是说)\\s+${escaped}\\b`, "i").test(text) ||
+    new RegExp(`\\b${escaped}\\b\\s+(?:is|was|'s)\\s+(?:just|only)\\s+(?:a\\s+)?(?:tv\\s+)?(?:joke|example|reference)\\b`, "i").test(text);
+  if (!negated) return false;
+  return !ACCEPTING.has(relationship) || !DIRECT_EXPERIENCE_RE.test(mentionWindow(text, name));
+}
+
+function shouldSkipLogisticalRejection(text: string, context: string, name: string, relationship: Relationship): boolean {
+  if (ACCEPTING.has(relationship)) return false;
+  const full = `${context} ${text}`;
+  if (!REJECTION_RE.test(full) && !LOGISTICAL_REJECTION_RE.test(text)) return false;
+  const window = mentionWindow(text, name) || mentionWindow(full, name);
+  if (DIRECT_EXPERIENCE_RE.test(window)) return false;
+  return LOGISTICAL_REJECTION_RE.test(window) || (context.toLowerCase().includes(name.toLowerCase()) && LOGISTICAL_REJECTION_RE.test(text));
+}
+
+function mentionWindow(text: string, name: string): string {
+  const idx = text.toLowerCase().indexOf(name.toLowerCase());
+  if (idx < 0) return "";
+  return text.slice(Math.max(0, idx - 80), Math.min(text.length, idx + name.length + 120));
+}
 
 /**
  * OpenMap — a map-aware memory layer for AI agents. The agent's conversation is
@@ -139,9 +180,9 @@ export class OpenMap {
     return this.db.addEvent({ ...e, id: null, createdAt: nowIso() });
   }
 
-  /** Build a place from a conversation mention. No POI lookup — but the name
-   * itself is evidence (a place called "Blue Bottle Coffee" implies coffee), so
-   * we tag it with concepts derived from its name. */
+  /** Build a place from a conversation mention. No POI lookup — but safe
+   * category words in the name (e.g. "Blue Bottle Coffee") are weak evidence.
+   * Vibes such as quiet/loud/crowded must come from user claims, not names. */
   private placeFromMention(name: string, userId = DEFAULT_USER): Place {
     const aliasTarget = this.db.resolvePlaceAlias(userId, name);
     if (aliasTarget) {
@@ -149,7 +190,7 @@ export class OpenMap {
       if (canonical) return canonical;
     }
     const p = rawToPlace(mentionToPlace(name));
-    if (p.tags.length === 0) p.tags = extractConcepts(name);
+    if (p.tags.length === 0) p.tags = extractConcepts(name).filter((c) => NAME_DERIVED_CONCEPTS.has(c));
     return p;
   }
 
@@ -200,6 +241,8 @@ export class OpenMap {
     const emb = this.embedder ? await this.embedder.embedOne(placeTextBlob(place)) : null;
     this.db.upsertPlace(place, emb);
     this.db.addPlaceAlias(o.userId, place.name, place.id);
+    for (const alias of generatedPlaceAliases(place.name))
+      if (!this.db.resolvePlaceAlias(o.userId, alias)) this.db.addPlaceAlias(o.userId, alias, place.id);
     for (const alias of Array.isArray(place.raw.aliases) ? place.raw.aliases : [])
       if (typeof alias === "string" && alias.trim()) this.db.addPlaceAlias(o.userId, alias, place.id);
     const mem: Memory = {
@@ -248,10 +291,12 @@ export class OpenMap {
 
       const rejection = REJECTION_RE.test(`${prev} ${text}`);
       for (const ex of await this.memExtractor.extract(text, { context: prev })) {
+        if (shouldSkipNegatedMention(text, ex.name, ex.relationship)) continue;
+        if (shouldSkipLogisticalRejection(text, prev, ex.name, ex.relationship)) continue;
         const place = this.placeFromMention(ex.name, userId);
         const exConcepts = canonicalConcepts(ex.concepts ?? []);
         if (exConcepts.length) place.tags = [...new Set([...place.tags, ...exConcepts])]; // richer tags from LLM
-        const goalContexts = [...new Set([ex.goal, ...goals].filter((g): g is string => !!g && ALLOWED_GOALS.includes(g)))];
+        const goalContexts = [...new Set([ex.goal, ...lexicalGoals].filter((g): g is string => !!g && ALLOWED_GOALS.includes(g)))];
         if (goalContexts.length) place.tags = [...new Set([...place.tags, ...goalContexts])]; // place-side affordance learned from the user's situation
         for (const c of [...exConcepts, ...conceptsFromTags(place.tags)]) observedConcepts.add(c);
         for (const g of goalContexts) observedIntents.add(g);
@@ -680,8 +725,12 @@ export const PlaceMemory = OpenMap;
 
 /** Build an OpenMap from config. Optionally inject an `llm` runner so extraction
  * borrows the host agent's model instead of openmap's own (BYOC). */
-export function buildOpenMap(cfg: Config = loadConfig(), opts: { llm?: LLMRunner } = {}): OpenMap {
+export function buildOpenMap(
+  cfg: Config = loadConfig(),
+  opts: { llm?: LLMRunner; allowHeuristicFallbackForTests?: boolean } = {},
+): OpenMap {
   const runner = opts.llm ?? getRunner(cfg);
+  assertModelConfigured(cfg, runner, { allowHeuristicFallbackForTests: opts.allowHeuristicFallbackForTests });
   return new OpenMap(
     new DB(cfg.dbPath),
     getEmbedder(cfg),

@@ -158,7 +158,7 @@ export function createOpenMapProvider(config?: Config, opts: { llmAvailable?: bo
     cfg.embedder = "none";
     cfg.tagger = "lexicon";
   }
-  const mem = buildOpenMap(cfg);
+  const mem = buildOpenMap(cfg, { allowHeuristicFallbackForTests: !llmAvailable });
   return new OpenMapProvider(mem);
 }
 

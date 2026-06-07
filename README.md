@@ -41,8 +41,11 @@ npm run build      # compile to dist/
 npm link           # optional: put `openmap` on PATH
 ```
 
-Runs offline with **zero keys** (local hashing embedder + lexicon fallback for
-extraction). Set `OPENAI_API_KEY` to upgrade embeddings + LLM extraction/intent.
+Public entry points require a model. Set `OPENAI_API_KEY`, `GEMINI_API_KEY`, or
+`GOOGLE_API_KEY`, or inject the host agent's model with `buildOpenMap(cfg, { llm })`.
+If no model is configured, CLI/MCP/library builders fail fast instead of running
+a key-free offline heuristic. The heuristic classes still exist for explicit
+tests and eval tooling, but they are not a production fallback.
 
 ## CLI (JSON to stdout, for agents)
 
@@ -67,6 +70,13 @@ openmap -u alice manual calibrate near 3
 openmap -u alice manual memory list
 
 openmap serve
+```
+
+First-run integration check:
+
+```bash
+openmap onboard          # config, privacy notes, and recommended host wiring
+openmap onboard --demo   # requires a model; no-write in-memory demo
 ```
 
 ### Auto-learning from conversation
@@ -109,6 +119,10 @@ const candidates = await hostMapSearch(plan.searchQuery, { near: plan.location }
 const ranked = await mem.rankCandidatePlaces("coffee near me", candidates, { userId, near });
 // ranked.results are live POIs, personalized but not persisted.
 ```
+
+When the host map provider returns stable place ids, pass them as `sourceId`
+with `source` so future memories canonicalize to the same place instead of
+depending on name matching.
 
 Raw turns are kept in an **L0 log** so the agent can recall original wording to ground a
 memory — `mem.searchConversation("the loud bar")` / the `conversation_search` MCP tool.
@@ -157,7 +171,7 @@ for (const r of await mem.recall("somewhere romantic for dinner", null, 5, "alic
 |-----|---------|---------|
 | `OPENMAP_DB` | `~/.openmap/openmap.db` | SQLite path |
 | `OPENMAP_EMBEDDER` | `auto` | `auto` \| `openai` \| `none` (no key → keyword-only recall) |
-| `OPENMAP_TAGGER` | `auto` | `auto` \| `llm` \| `lexicon` (intent/concept extraction) |
+| `OPENMAP_TAGGER` | `auto` | `auto` \| `llm`; `lexicon` is disabled for public builders |
 | `OPENMAP_MODEL_TAGGER` / `_EXTRACTOR` / `_PERSONA` | base chat model | per-component LLM model |
 | `OPENMAP_BELIEF_HALFLIFE_DAYS` | `60` | recency decay for inferred beliefs (0 = off) |
 | `OPENAI_API_KEY` | — | enables OpenAI embeddings + LLM extraction |
@@ -172,7 +186,7 @@ injectable `LLMRunner`, so you can:
    own key: `buildOpenMap(cfg, { llm: myRunner })`.
 2. **BYOC endpoint** — set `OPENAI_API_KEY` + `OPENMAP_OPENAI_BASE_URL` to any
    OpenAI-compatible backend (DeepSeek, a local server, a Claude gateway).
-3. **Offline** — no key, no runner → deterministic lexicon/heuristic fallback.
+3. **No offline fallback** — no key and no injected runner → user-facing error.
 
 Each component (`tagger` / `extractor` / `persona`) can use a different model.
 
@@ -201,7 +215,7 @@ noise/crowd/transit-access thresholds, `memory/regions` frequented areas), joine
 
 ```bash
 npm run typecheck   # tsc --noEmit
-npm test            # node:test, offline & network-free
+npm test            # node:test, network-free via injected fake runners/components
 npm run eval        # dataset eval; uses .env.local LLM when configured
 npm run eval:compare # offline vs LLM/stub extraction comparison
 npm run eval:replay # JSON replay snapshot for ranking/memory regression tracking
@@ -211,10 +225,22 @@ npm run eval:all:replay -- --out=baseline.json # aggregate replay snapshot for C
 npm run eval:field  # broader field-style replay: cities/languages/use-cases
 npm run eval:field:compare # offline vs LLM on the field replay suite
 npm run eval:field:replay -- --out=field.json # field replay snapshot
+npm run eval -- --dataset=realistic-llm-dataset.json # LLM-only realistic extraction suite
 npm run eval:replay:diff -- before.json after.json # compare snapshots; exits non-zero on regressions
 npm run eval:providers -- --providers=openmap,mem0,tencentdb,gbrain --dataset=field-dataset.json
 npm run build
 ```
+
+In eval script names, `offline` means the explicit test/eval heuristic baseline
+enabled with an internal opt-in. CLI, MCP, and normal `buildOpenMap()` usage still
+require a model and report an error when none is configured.
+
+`realistic-llm-dataset.json` is intentionally not part of the heuristic baseline:
+it is a realistic conversation-shape extraction suite where every probe is
+`llmOnly`. Use it with `.env.local` configured for Gemini/OpenAI-compatible
+models to evaluate actual place extraction, alias/correction handling, scoped
+sentiment, false positives, and bilingual turns. Regex/lexicon test helpers
+should skip this suite rather than define product quality.
 
 ### Cross-provider eval
 

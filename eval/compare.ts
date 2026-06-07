@@ -36,7 +36,10 @@ export async function compare(
   const cfg = loadConfig();
   const base = { ...cfg, dbPath: ":memory:", embedder: "none" as const }; // hold embeddings out → compare extraction only
 
-  const offlineMem = buildOpenMap({ ...base, openaiApiKey: null, tagger: "lexicon" });
+  const offlineMem = buildOpenMap(
+    { ...base, openaiApiKey: null, tagger: "lexicon" },
+    { allowHeuristicFallbackForTests: true },
+  );
   const offline = await runEval(dataset, offlineMem, { llmAvailable: false });
 
   const realKey = Boolean(cfg.openaiApiKey);

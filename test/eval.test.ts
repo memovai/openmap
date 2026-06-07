@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
 
 import { buildOpenMap } from "../src/openmap.js";
-import { loadConfig, resolvedEmbedder } from "../src/core/config.js";
+import { LEXICON_DISABLED_ERROR, MODEL_REQUIRED_ERROR, loadConfig, resolvedEmbedder } from "../src/core/config.js";
 import { runEval, type EvalDataset } from "../eval/harness.js";
 import { compare } from "../eval/compare.js";
 import { StubLLMRunner } from "../eval/stub-llm.js";
@@ -14,10 +14,23 @@ import { runProviderCompare } from "../eval/provider-compare.js";
 
 const loadDataset = async (name: string): Promise<EvalDataset> =>
   JSON.parse(await readFile(new URL(`../eval/${name}`, import.meta.url), "utf-8")) as EvalDataset;
+const testOpenMap = () =>
+  buildOpenMap({ ...loadConfig({}), dbPath: ":memory:" }, { allowHeuristicFallbackForTests: true });
+
+test("public OpenMap builder fails fast without a model", () => {
+  assert.throws(
+    () => buildOpenMap({ ...loadConfig({}), dbPath: ":memory:" }),
+    new RegExp(MODEL_REQUIRED_ERROR.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+  );
+  assert.throws(
+    () => buildOpenMap({ ...loadConfig({ OPENAI_API_KEY: "test" } as NodeJS.ProcessEnv), dbPath: ":memory:", tagger: "lexicon" }),
+    new RegExp(LEXICON_DISABLED_ERROR.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")),
+  );
+});
 
 test("place-memory mini eval: all offline probes pass", async () => {
   const dataset = await loadDataset("dataset.json");
-  const mem = buildOpenMap({ ...loadConfig({}), dbPath: ":memory:" }); // offline (empty env)
+  const mem = testOpenMap(); // explicit no-API heuristic path for tests
   const report = await runEval(dataset, mem, { llmAvailable: false });
 
   const failed = report.results.filter((r) => r.status === "fail");
@@ -31,7 +44,7 @@ test("place-memory mini eval: all offline probes pass", async () => {
 
 test("field replay eval: broader map-assistant transcripts pass offline", async () => {
   const dataset = await loadDataset("field-dataset.json");
-  const mem = buildOpenMap({ ...loadConfig({}), dbPath: ":memory:" });
+  const mem = testOpenMap();
   const report = await runEval(dataset, mem, { llmAvailable: false });
   const failed = report.results.filter((r) => r.status === "fail");
   assert.deepEqual(
@@ -115,7 +128,7 @@ test("field replay eval: LLM(stub) path also passes", async () => {
 
 test("eval replay snapshot captures report, recalls, scenarios, routines, and profile", async () => {
   const dataset = await loadDataset("dataset.json");
-  const mem = buildOpenMap({ ...loadConfig({}), dbPath: ":memory:" });
+  const mem = testOpenMap();
   const snapshot = await buildReplaySnapshot(dataset, mem, { llmAvailable: false, generatedAt: "test" });
   assert.equal(snapshot.dataset, dataset.name);
   assert.equal(snapshot.generatedAt, "test");

@@ -4,8 +4,8 @@ import { join } from "node:path";
 
 export interface Config {
   dbPath: string;
-  embedder: string; // auto | openai | none  (no offline embedder — keyword-only without a provider)
-  tagger: string; // auto | lexicon | llm  (concept/intent extraction)
+  embedder: string; // auto | openai | none
+  tagger: string; // auto | llm (lexicon is test-only and disabled for public builders)
   openaiApiKey: string | null;
   /** OpenAI-compatible base URL (BYOC) — DeepSeek / Gemini / local / gateway. */
   openaiBaseUrl: string | null;
@@ -17,6 +17,10 @@ export interface Config {
 }
 
 const GEMINI_BASE_URL = "https://generativelanguage.googleapis.com/v1beta/openai/";
+export const MODEL_REQUIRED_ERROR =
+  "OpenMap requires an LLM. Set OPENAI_API_KEY, GEMINI_API_KEY, or GOOGLE_API_KEY, or inject buildOpenMap(cfg, { llm }). Offline lexicon/heuristic mode is disabled.";
+export const LEXICON_DISABLED_ERROR =
+  "OPENMAP_TAGGER=lexicon is disabled for public OpenMap builders. Configure an LLM instead.";
 
 let envFilesLoaded = false;
 /** Load `.env.local` then `.env` from cwd into process.env (without overriding
@@ -48,7 +52,8 @@ function loadEnvFiles(): void {
  * covers how that conversation is understood (extraction/embeddings/models) and
  * remembered. Reads env (auto-loading `.env.local`/`.env`). Natively recognizes a
  * Gemini key (`GEMINI_API_KEY`/`GOOGLE_API_KEY`) and routes via Google's
- * OpenAI-compatible endpoint. Everything defaults so it runs offline.
+ * OpenAI-compatible endpoint. Public builders fail fast when no model is
+ * configured; the key-free heuristic components are only for explicit tests.
  */
 export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   if (env === process.env) loadEnvFiles();
@@ -60,7 +65,7 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
 
   return {
     dbPath: env.OPENMAP_DB ?? join(homedir(), ".openmap", "openmap.db"),
-    embedder: env.OPENMAP_EMBEDDER ?? "auto", // auto → real embeddings when a key is set, else keyword-only
+    embedder: env.OPENMAP_EMBEDDER ?? "auto", // auto → real embeddings when a key is set
     tagger: env.OPENMAP_TAGGER ?? "auto",
     openaiApiKey: apiKey,
     openaiBaseUrl: env.OPENMAP_OPENAI_BASE_URL ?? (usingGemini ? GEMINI_BASE_URL : null),
@@ -83,8 +88,18 @@ export function resolvedEmbedder(cfg: Config): "openai" | "none" {
   return cfg.openaiApiKey ? "openai" : "none"; // auto
 }
 
-export function resolvedTagger(cfg: Config): "llm" | "lexicon" {
-  if (cfg.tagger === "llm") return "llm";
-  if (cfg.tagger === "lexicon") return "lexicon";
-  return cfg.openaiApiKey ? "llm" : "lexicon"; // auto
+export function resolvedTagger(cfg: Config): "llm" | "missing" | "disabled" {
+  if (cfg.tagger === "lexicon") return "disabled";
+  if (cfg.tagger === "llm") return cfg.openaiApiKey ? "llm" : "missing";
+  return cfg.openaiApiKey ? "llm" : "missing"; // auto
+}
+
+export function assertModelConfigured(
+  cfg: Config,
+  runner?: unknown,
+  opts: { allowHeuristicFallbackForTests?: boolean } = {},
+): void {
+  if (opts.allowHeuristicFallbackForTests) return;
+  if (cfg.tagger === "lexicon") throw new Error(LEXICON_DISABLED_ERROR);
+  if (!runner && !cfg.openaiApiKey) throw new Error(MODEL_REQUIRED_ERROR);
 }

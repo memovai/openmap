@@ -16,6 +16,7 @@ import {
   placeTextBlob,
   rawToPlace,
 } from "../core/types.js";
+import { CROWDED_TERMS, LOUD_TERMS, LOW_CROWD_TERMS, constraintConceptTerms } from "../core/vocabulary.js";
 import { rankMemory, type RankingBeliefSignals } from "./ranking.js";
 
 export interface CandidatePlaceInput {
@@ -94,12 +95,6 @@ export interface CandidateRankingArgs extends SearchAssistArgs {
 }
 
 const round = (x: number, n = 3) => Number(x.toFixed(n));
-const VIBE_TERMS = new Set(["cozy", "quiet", "loud", "romantic", "lively", "outdoor", "fancy", "cheap"]);
-const LOW_CROWD_TERMS = new Set(["low_crowd", "uncrowded", "calm"]);
-const LOUD_TERMS = new Set(["loud", "noisy", "noise"]);
-const CROWDED_TERMS = new Set(["crowded", "busy", "packed"]);
-const NEGATIVE_AFFORDANCE_TERMS = new Set(["loud", "noisy", "noise", "crowded", "busy", "packed", "touristy", "cramped", "expensive"]);
-
 export async function buildPlaceSearchPlan(args: SearchAssistArgs): Promise<PlaceSearchPlan> {
   const { db, tagger, userId, query, near = null } = args;
   const baseFrame = await tagger.frame(query);
@@ -120,8 +115,8 @@ export async function buildPlaceSearchPlan(args: SearchAssistArgs): Promise<Plac
     ...frame.vibe,
     ...frame.goals,
     ...constraintTerms(frame),
-    ...profile.likes.slice(0, 8),
-    ...profile.pursues.slice(0, 4),
+    ...profile.likes.filter((t) => shouldExpandFromProfile(t, baseFrame)).slice(0, 8),
+    ...profile.pursues.filter((t) => shouldExpandFromProfile(t, baseFrame)).slice(0, 4),
   ]).filter((t) => !profile.avoids.includes(t));
   const avoid = unique(profile.avoids.slice(0, 10));
   const extra = include.filter((t) => !query.toLowerCase().includes(t.replace(/_/g, " "))).slice(0, 6);
@@ -233,10 +228,9 @@ function memoryProfile(db: DB, userId: string): PlaceSearchPlan["profile"] {
       .filter((b) => b.confidence >= 0.3 && (b.otype === "concept" || b.otype === "goal"))
       .map((b) => b.object);
   const positiveTags = tagCounts(db.iterRemembered(userId).filter((r) => r.aggAffect > 0.2));
-  const negativeTags = tagCounts(db.iterRemembered(userId).filter((r) => r.aggAffect < -0.2)).filter((t) => NEGATIVE_AFFORDANCE_TERMS.has(t));
   return {
     likes: unique([...prefs.likes, ...prefs.vibes, ...prefs.dietary, ...beliefs("likes"), ...positiveTags]),
-    avoids: unique([...prefs.dislikes, ...beliefs("avoids"), ...negativeTags]),
+    avoids: unique([...prefs.dislikes, ...beliefs("avoids")]),
     pursues: unique([...beliefs("pursues")]),
   };
 }
@@ -260,10 +254,6 @@ function completeFrameWithMemory(frame: IntentFrame, profile: PlaceSearchPlan["p
     vibe: [...frame.vibe],
     constraints: { ...frame.constraints, dietary: frame.constraints.dietary ? [...frame.constraints.dietary] : undefined },
   };
-  for (const term of profile.likes) {
-    if (VIBE_TERMS.has(term)) out.vibe = unique([...out.vibe, term]);
-    else if (!LOW_CROWD_TERMS.has(term)) out.concepts = unique([...out.concepts, term]);
-  }
   if (!out.constraints.noise && (profile.avoids.some((t) => LOUD_TERMS.has(t)) || profile.likes.includes("quiet"))) out.constraints.noise = "quiet";
   if (!out.constraints.crowd && (profile.avoids.some((t) => CROWDED_TERMS.has(t)) || profile.likes.some((t) => LOW_CROWD_TERMS.has(t)))) out.constraints.crowd = "low";
   if (!out.constraints.dietary?.length) {
@@ -271,6 +261,10 @@ function completeFrameWithMemory(frame: IntentFrame, profile: PlaceSearchPlan["p
     if (dietary.length) out.constraints.dietary = dietary;
   }
   return out;
+}
+
+function shouldExpandFromProfile(term: string, frame: IntentFrame): boolean {
+  return frameSurfaceTerms(frame).has(term.toLowerCase().trim());
 }
 
 function resolveLocation(anchors: Anchors, near: GeoPoint | null): { location: GeoPoint | null; anchor: PlaceSearchPlan["anchor"] } {
@@ -329,16 +323,11 @@ function lexicalRelevance(queryText: string, place: Place): number {
 }
 
 function constraintTerms(frame: IntentFrame): string[] {
-  const c = frame.constraints;
-  return [
-    ...(c.openNow ? ["open_late"] : []),
-    ...(c.walkable ? ["walkable"] : []),
-    ...(c.dietary ?? []),
-    ...(c.maxBudget ? [c.maxBudget === "low" ? "cheap" : c.maxBudget === "high" ? "fancy" : "mid_budget"] : []),
-    ...(c.noise === "quiet" ? ["quiet"] : c.noise === "loud" ? ["loud"] : []),
-    ...(c.crowd === "low" ? ["low_crowd", "uncrowded"] : c.crowd === "high" ? ["crowded"] : []),
-    ...(c.travelMode === "walk" ? ["walkable"] : c.travelMode === "transit" ? ["transit", "station"] : c.travelMode === "drive" ? ["parking"] : []),
-  ];
+  return constraintConceptTerms(frame.constraints);
+}
+
+function frameSurfaceTerms(frame: IntentFrame): Set<string> {
+  return new Set([...frame.concepts, ...frame.vibe, ...frame.goals, ...constraintTerms(frame)].map((t) => t.toLowerCase().trim()).filter(Boolean));
 }
 
 function tokens(text: string): string[] {
